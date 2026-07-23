@@ -6,7 +6,7 @@ A single-user accountability drill sergeant that lives in your **iMessage**. It 
 
 ## Deploy
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/orenabramov157-cmd/accountability-bot)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/orenabramov157-cmd/aris-bitch)
 
 Then open **[HANDOFF.md](HANDOFF.md)** and follow it top to bottom (≈25 minutes, browser only, no terminal). If you have an AI assistant — ChatGPT, Codex, Claude, anything — open HANDOFF.md in the chat and ask it to walk you through.
 
