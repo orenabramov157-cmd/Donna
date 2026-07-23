@@ -1,0 +1,27 @@
+# Copy to .dev.vars for local `wrangler dev`. NEVER commit .dev.vars.
+# In production these are set in the Cloudflare dashboard:
+# Worker → Settings → Variables and Secrets → Add (type: Secret)
+
+# LoopMessage (dashboard → API credentials)
+LOOP_AUTH_KEY = "org-api-key-from-loopmessage-dashboard"
+# The Authorization header value you configure in LoopMessage's webhook settings.
+# Generate something long and random; paste the same value in both places.
+LOOP_WEBHOOK_AUTH = "long-random-string"
+
+# The owner's iMessage contact: phone in E.164 (+13105551234) or Apple ID email
+OWNER_CONTACT = "+13105551234"
+
+# Trello: https://trello.com/power-ups/admin -> new Power-Up -> API key,
+# then generate a token from the key page. Board ID is in the board URL or /setup will help.
+TRELLO_KEY = ""
+TRELLO_TOKEN = ""
+TRELLO_BOARD_ID = ""
+
+# Guards for the bot's own URLs. Generate two long random strings (e.g. `openssl rand -hex 24`).
+SETUP_KEY = ""
+WEBHOOK_TOKEN = ""
+
+# Only needed if CHANNEL=twilio (SMS fallback)
+# TWILIO_ACCOUNT_SID = ""
+# TWILIO_AUTH_TOKEN = ""
+# TWILIO_FROM = "+1..."

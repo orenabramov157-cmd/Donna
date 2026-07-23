@@ -1,0 +1,42 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "accountability-bot",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  // No database_id: the Deploy-to-Cloudflare flow (and `wrangler deploy`)
+  // auto-provisions the database on first deploy. Schema is applied by the
+  // Worker itself (src/schema.ts), so no CLI migration step exists.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "accountability-bot-db"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "vars": {
+    "TIMEZONE": "America/Los_Angeles",
+    "MORNING_TIME": "08:00",
+    "EVENING_TIME": "20:30",
+    "WORK_START": "09:00",
+    "WORK_END": "18:00",
+    "QUIET_START": "22:00",
+    "QUIET_END": "07:30",
+    "NAG_LEVEL": "standard",
+    "PULSE_EVERY_MIN": "150",
+    "CHANNEL": "loopmessage",
+    "AI_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
+    "AI_DAILY_CAP": "40",
+    "TRELLO_TODAY_LIST": "Today",
+    "TRELLO_DONE_LIST": "Done"
+  }
+}
