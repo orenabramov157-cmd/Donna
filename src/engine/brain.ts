@@ -216,6 +216,7 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     `{"type":"complete","task":n} {"type":"start","task":n} {"type":"notdone","task":n} {"type":"snooze","task":n,"minutes":m} {"type":"defer","task":n} {"type":"drop","task":n,"reason":str|null} {"type":"blocked","task":n,"reason":str} {"type":"set_time","task":n,"time":"HH:MM","date":"YYYY-MM-DD"|null}`,
     `{"type":"status"} {"type":"plan"} {"type":"no_plan"} {"type":"confirm_plan"} {"type":"undo"} {"type":"help"} {"type":"set_nag","level":"gentle|standard|relentless"}`,
     `Rules:`,
+    `- Relative times: "in 5 minutes" / "in an hour" → add to the current local time (${input.parts.hhmm}) and output the resulting HH:MM as remind_time.`,
     `- Match tasks by meaning ("the deck" = whichever open task is about the deck).`,
     `- If the message is conversation with no task operation, actions=[] and write "reply" in the owner's style (<=300 chars).`,
     `- If you genuinely can't tell which task or what time, actions=[] and ask ONE short specific "question". Never dump a command list.`,
@@ -225,29 +226,43 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     .filter(Boolean)
     .join('\n');
 
-  try {
-    const out: unknown = await env.AI.run(
-      (env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast') as Parameters<Ai['run']>[0],
-      {
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: input.text },
-        ],
-        max_tokens: 500,
-      },
-    );
-    const response =
-      out && typeof out === 'object' && 'response' in out && typeof (out as { response: unknown }).response === 'string'
-        ? (out as { response: string }).response
-        : null;
-    if (!response) return null;
-    const result = validateInterpretation(response, input.tasks.length, input.todayLocal);
-    if (!result || result.confidence < 0.5) return null;
-    return result;
-  } catch (err) {
-    console.error(JSON.stringify({ evt: 'brain_failed', err: err instanceof Error ? err.message : String(err) }));
-    return null;
+  // Two attempts: models whiff stochastically, and a fresh roll usually
+  // lands. Each attempt consumes AI budget honestly.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0 && !(await aiBudgetOk(env, input.todayLocal))) break;
+    try {
+      const out: unknown = await env.AI.run(
+        (env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast') as Parameters<Ai['run']>[0],
+        {
+          messages: [
+            { role: 'system', content: system },
+            { role: 'user', content: input.text },
+          ],
+          max_tokens: 500,
+        },
+      );
+      const response =
+        out && typeof out === 'object' && 'response' in out && typeof (out as { response: unknown }).response === 'string'
+          ? (out as { response: string }).response
+          : null;
+      if (!response) continue;
+      const result = validateInterpretation(response, input.tasks.length, input.todayLocal);
+      if (!result) {
+        console.error(JSON.stringify({ evt: 'brain_unparsed', attempt, sample: response.slice(0, 240) }));
+        continue;
+      }
+      if (result.actions.length > 0 && result.confidence < 0.5) {
+        // Never execute uncertain actions — but a question or reply is safe.
+        if (result.question || result.reply) return { ...result, actions: [] };
+        console.error(JSON.stringify({ evt: 'brain_low_confidence', attempt, confidence: result.confidence }));
+        continue;
+      }
+      return result;
+    } catch (err) {
+      console.error(JSON.stringify({ evt: 'brain_failed', attempt, err: err instanceof Error ? err.message : String(err) }));
+    }
   }
+  return null;
 }
 
 // -- nightly reflection (v1.2) ----------------------------------------------
