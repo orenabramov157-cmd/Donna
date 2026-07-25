@@ -164,6 +164,28 @@ export function validateInterpretation(rawText: string, taskCount: number, today
   };
 }
 
+// Workers AI models are not consistent about output shape: some return
+// { response }, some { result: { response } }, some OpenAI-style choices.
+function extractModelText(out: unknown): string | null {
+  if (!out || typeof out !== 'object') return typeof out === 'string' && out.length > 0 ? out : null;
+  const o = out as Record<string, unknown>;
+  if (typeof o.response === 'string' && o.response.length > 0) return o.response;
+  const result = o.result;
+  if (result && typeof result === 'object') {
+    const r = result as Record<string, unknown>;
+    if (typeof r.response === 'string' && r.response.length > 0) return r.response;
+  }
+  const choices = o.choices;
+  if (Array.isArray(choices) && choices[0] && typeof choices[0] === 'object') {
+    const msg = (choices[0] as Record<string, unknown>).message;
+    if (msg && typeof msg === 'object') {
+      const content = (msg as Record<string, unknown>).content;
+      if (typeof content === 'string' && content.length > 0) return content;
+    }
+  }
+  return null;
+}
+
 export interface BrainInput {
   text: string;
   tasks: TaskRow[];
@@ -241,11 +263,13 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
           max_tokens: 500,
         },
       );
-      const response =
-        out && typeof out === 'object' && 'response' in out && typeof (out as { response: unknown }).response === 'string'
-          ? (out as { response: string }).response
-          : null;
-      if (!response) continue;
+      const response = extractModelText(out);
+      if (!response) {
+        console.error(
+          JSON.stringify({ evt: 'brain_empty', attempt, shape: JSON.stringify(out).slice(0, 240) }),
+        );
+        continue;
+      }
       const result = validateInterpretation(response, input.tasks.length, input.todayLocal);
       if (!result) {
         console.error(JSON.stringify({ evt: 'brain_unparsed', attempt, sample: response.slice(0, 240) }));
@@ -295,10 +319,7 @@ export async function reflect(
       (env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast') as Parameters<Ai['run']>[0],
       { messages: [{ role: 'system', content: system }, { role: 'user', content: 'Update the cards.' }], max_tokens: 400 },
     );
-    const response =
-      out && typeof out === 'object' && 'response' in out && typeof (out as { response: unknown }).response === 'string'
-        ? (out as { response: string }).response
-        : null;
+    const response = extractModelText(out);
     if (!response) return null;
     const m = /\{[\s\S]*\}/.exec(response);
     if (!m) return null;
