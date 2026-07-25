@@ -969,9 +969,13 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
 <h1>🤖 Accountability Bot — Setup</h1>
 <table cellpadding="6">${rows}</table>
 <h2>Wire up LoopMessage</h2>
-<p>In the LoopMessage dashboard → Webhooks, set the callback URL to:</p>
+<p>Using the free sandbox? The fields live on the <b>Sandbox</b> page of the LoopMessage dashboard
+(<i>Sandbox Webhook URL</i> + <i>Sandbox Webhook Header</i>) — <b>not</b> under API → Settings, which only
+covers paid dedicated senders. Set the webhook URL to:</p>
 <pre style="background:#f4f4f4;padding:10px;overflow-x:auto">${esc(loopWebhookUrl)}</pre>
-<p>…and set its <b>Authorization</b> header to the same value as your <code>LOOP_WEBHOOK_AUTH</code> secret.</p>
+<p>…and set the webhook <b>header</b> field to exactly the same value as your <code>LOOP_WEBHOOK_AUTH</code>
+secret. Paste carefully — one stray character causes silent 401 rejections (their Webhooks history page
+shows <i>failed 401</i> and has a Retry button if that happens).</p>
 <p><a href="?key=${esc(requestUrl.searchParams.get('key') ?? '')}&test=1">Send a test iMessage →</a></p>
 <p>${coreReady ? 'Core is ready. Text the bot "help" to begin. 🫡' : 'Fix the ❌ rows above, then reload this page.'}</p>
 </body>`;

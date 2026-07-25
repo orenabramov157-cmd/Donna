@@ -31,9 +31,10 @@ free tier. Your computer is only needed for this setup; afterwards it can sleep 
 
 ## Step 3 — LoopMessage (the iMessage pipe)
 
-1. Sign up free at [loopmessage.com](https://loopmessage.com) and open their dashboard.
-2. Find the **sandbox** section and register **your own phone number** (or Apple ID email) as a sandbox contact, following their instructions.
-3. Find your **Organization API Key** in the dashboard. Keep that tab open — you'll paste the key in Step 5.
+1. Sign up free at [loopmessage.com](https://loopmessage.com) and open their dashboard, then click **View** on your Default organization.
+2. In the left sidebar, open **Sandbox** and register **your own phone number** (or Apple ID email) as a sandbox contact. ⚠️ It must match whatever your iPhone uses in **Settings → Messages → Send & Receive → "Start new conversations from"** (usually your phone number).
+3. In the left sidebar under **API → Settings**, find your **Organization API Key**. Keep that tab open — you'll paste the key in Step 5.
+4. Know this rule now, it explains a later step: **the sandbox can never text you first.** You must send the first message (Step 9 handles it — the bot's first send error even gives you a personal opt-in link if needed).
 
 ✅ **Check:** your number is listed as a sandbox contact and you can see the API key.
 
@@ -93,13 +94,19 @@ https://accountability-bot.YOURNAME.workers.dev/setup?key=YOUR_SETUP_KEY
 
 The page shows a checklist. Fix any ❌ (usually a mistyped secret) and reload.
 
-Then follow the **"Wire up LoopMessage"** box on that page: in the LoopMessage dashboard's webhook settings, paste the callback URL it shows, and set the webhook's **Authorization** header to your `LOOP_WEBHOOK_AUTH` string.
+Then follow the **"Wire up LoopMessage"** box on that page — and here is the #1 trap of the whole setup: **for the free sandbox, the webhook fields are on the *Sandbox* page** of the LoopMessage dashboard (**Sandbox Webhook URL** and **Sandbox Webhook Header**), *not* the similar-looking fields under API → Settings (those only apply to paid senders).
+
+1. **Sandbox Webhook URL** ← the full URL from the setup page's gray box
+2. **Sandbox Webhook Header** ← your `LOOP_WEBHOOK_AUTH` string, pasted *exactly* — select just the string, no trailing spaces or characters. One stray character = the bot silently rejects everything with 401.
+3. Click **Save sandbox**.
 
 ✅ **Check:** every row on the setup page is ✅.
 
 ## Step 9 — Test it
 
 Click **"Send a test iMessage"** on the setup page. Your phone should buzz within seconds.
+
+**If it fails with "send failed":** the sandbox can't text you first (their anti-spam rule). The failure detail in the Worker logs includes a personal **opt-in link** (`https://opt-in.imsg.link/...`) — open it on your iPhone, send the pre-filled message it creates, then click "Send a test iMessage" again. Sending the sandbox any first message from your phone accomplishes the same thing.
 
 Reply **`help`** to see the commands. Reply **`plan`** to plan your first day.
 
@@ -117,7 +124,7 @@ Reply **`help`** to see the commands. Reply **`plan`** to plan your first day.
 ## Troubleshooting
 
 - **No texts?** `/health` should show a recent `last_cron_at`. Check LoopMessage's webhook history in their dashboard, and Cloudflare → your Worker → **Logs** (live tail).
-- **Bot doesn't answer replies?** The LoopMessage webhook URL or its Authorization header doesn't match — redo Step 8's wiring box.
+- **Bot doesn't answer replies?** Check LoopMessage's **API → Webhooks history** page. "No data" = the *Sandbox* webhook fields were never filled (Step 8 — they're on the Sandbox page, not API Settings). Rows showing **failed 401** = the header value doesn't exactly match your `LOOP_WEBHOOK_AUTH` secret — re-paste it cleanly, Save sandbox, then press **Retry** on the failed rows.
 - **Trello not syncing?** Re-run `/setup` — it re-registers the board webhook and re-resolves the Today/Done lists.
 - **Changed a secret?** Re-run `/setup` afterwards.
 - Setup page is safe to re-run anytime; it never duplicates anything.

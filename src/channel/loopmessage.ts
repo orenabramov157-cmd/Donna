@@ -45,8 +45,20 @@ export const loopMessage: Channel = {
   },
 
   async parseWebhook(request: Request, env: AppEnv): Promise<Inbound | null> {
-    const auth = request.headers.get('Authorization') ?? '';
-    if (!env.LOOP_WEBHOOK_AUTH || !(await timingSafeEqualStr(env.LOOP_WEBHOOK_AUTH, auth))) {
+    // Tolerate an optional "Bearer " prefix and stray whitespace — the
+    // LoopMessage dashboard's example value suggests a Bearer-prefixed form.
+    const rawAuth = request.headers.get('Authorization') ?? '';
+    const auth = rawAuth.replace(/^Bearer\s+/i, '').trim();
+    const want = (env.LOOP_WEBHOOK_AUTH ?? '').trim();
+    if (!want || !(await timingSafeEqualStr(want, auth))) {
+      console.error(
+        JSON.stringify({
+          evt: 'loop_webhook_auth_failed',
+          gotLen: auth.length,
+          wantLen: want.length,
+          hadBearer: /^Bearer\s+/i.test(rawAuth),
+        }),
+      );
       return null;
     }
     let b: Record<string, unknown>;
