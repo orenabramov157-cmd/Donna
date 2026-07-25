@@ -1,10 +1,9 @@
-// Reply understanding. Deterministic grammar first — it always works, costs
-// nothing, and is the documented command set. Workers AI expands coverage to
-// natural language but is capped per day and never trusted below a
-// confidence floor; on any failure the engine asks for keywords.
+// Deterministic command grammar — the always-works fast path and the offline
+// fallback. Conversational understanding lives in engine/brain.ts; this file
+// stays zero-AI so the core loop never depends on model availability.
 
 import type { AppEnv } from './env';
-import { getSetting, setSetting, type TaskRow } from './db';
+import { getSetting, setSetting } from './db';
 import { extractTrailingTime } from './time';
 
 export type NagLevel = 'gentle' | 'standard' | 'relentless';
@@ -24,6 +23,7 @@ export type Command =
   | { op: 'undo' }
   | { op: 'help' }
   | { op: 'settings' }
+  | { op: 'resetmemory' }
   | { op: 'naglevel'; level: NagLevel }
   | { op: 'ok' }
   | { op: 'freetext'; text: string };
@@ -65,6 +65,7 @@ export function parseDeterministic(raw: string): Command {
   if (/^undo[.!]*$/i.test(t)) return { op: 'undo' };
   if (/^(?:help|\?|commands)[?.!]*$/i.test(t)) return { op: 'help' };
   if (/^settings[?.!]*$/i.test(t)) return { op: 'settings' };
+  if (/^reset\s+(?:memory|brain)[.!]*$/i.test(t)) return { op: 'resetmemory' };
   if ((m = /^nag\s+(gentle|standard|relentless)$/i.exec(t))) {
     return { op: 'naglevel', level: m[1] as NagLevel };
   }
@@ -73,23 +74,7 @@ export function parseDeterministic(raw: string): Command {
   return { op: 'freetext', text };
 }
 
-// -- Workers AI fallback ----------------------------------------------------
-
-const AI_OPS = new Set([
-  'done',
-  'start',
-  'snooze',
-  'tomorrow',
-  'notdone',
-  'blocked',
-  'drop',
-  'add',
-  'plan',
-  'status',
-  'undo',
-  'help',
-]);
-
+// Shared daily AI-call budget (used by engine/brain.ts).
 export async function aiBudgetOk(env: AppEnv, localDate: string): Promise<boolean> {
   const cap = Number(env.AI_DAILY_CAP || '40');
   const key = `ai_calls_${localDate}`;
@@ -97,85 +82,4 @@ export async function aiBudgetOk(env: AppEnv, localDate: string): Promise<boolea
   if (used >= cap) return false;
   await setSetting(env.DB, key, String(used + 1));
   return true;
-}
-
-export async function aiInterpret(
-  env: AppEnv,
-  localDate: string,
-  text: string,
-  tasks: TaskRow[],
-): Promise<Command | null> {
-  if (!(await aiBudgetOk(env, localDate))) return null;
-  const list = tasks.map((t, i) => `${i + 1}. ${t.title}`).join('\n') || '(no open tasks)';
-  const system = [
-    'You convert one incoming text message into ONE JSON command for a personal task-accountability bot.',
-    'Open tasks:',
-    list,
-    'Output ONLY compact JSON, no prose:',
-    '{"op":"done|start|snooze|tomorrow|notdone|blocked|drop|add|status|freetext","taskRef":<1-based task number or null>,"minutes":<int or null>,"reason":<string or null>,"title":<string or null>,"time":"HH:MM or null","confidence":<0..1>}',
-    'op=done when the message reports finishing a task (match by meaning). op=add when it describes a new task.',
-    'If you are not sure what the message means, use op="freetext" with low confidence.',
-  ].join('\n');
-  try {
-    const out: unknown = await env.AI.run(
-      (env.AI_MODEL || '@cf/meta/llama-3.1-8b-instruct-fast') as Parameters<Ai['run']>[0],
-      {
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: text },
-        ],
-        max_tokens: 160,
-      },
-    );
-    const response =
-      out && typeof out === 'object' && 'response' in out && typeof (out as { response: unknown }).response === 'string'
-        ? (out as { response: string }).response
-        : null;
-    if (!response) return null;
-    const jsonMatch = /\{[\s\S]*\}/.exec(response);
-    if (!jsonMatch) return null;
-    const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
-    const op = typeof parsed.op === 'string' ? parsed.op : '';
-    const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0;
-    if (!AI_OPS.has(op) || confidence < 0.7) return null;
-    const taskRef =
-      typeof parsed.taskRef === 'number' && parsed.taskRef >= 1 && parsed.taskRef <= tasks.length
-        ? parsed.taskRef
-        : undefined;
-    switch (op) {
-      case 'done':
-        return { op: 'done', taskRef };
-      case 'start':
-        return { op: 'start', taskRef };
-      case 'snooze':
-        return {
-          op: 'snooze',
-          minutes: typeof parsed.minutes === 'number' && parsed.minutes >= 5 ? Math.min(parsed.minutes, 480) : 30,
-          taskRef,
-        };
-      case 'tomorrow':
-        return { op: 'tomorrow', taskRef };
-      case 'notdone':
-        return { op: 'notdone', taskRef };
-      case 'blocked':
-        return { op: 'blocked', reason: typeof parsed.reason === 'string' ? parsed.reason : 'unspecified', taskRef };
-      case 'drop': {
-        const reason = typeof parsed.reason === 'string' && parsed.reason ? parsed.reason : undefined;
-        return { op: 'drop', taskRef, ...(reason ? { reason } : {}) };
-      }
-      case 'add': {
-        const title = typeof parsed.title === 'string' && parsed.title.trim() ? parsed.title.trim() : null;
-        if (!title) return null;
-        const time = typeof parsed.time === 'string' && /^\d{2}:\d{2}$/.test(parsed.time) ? parsed.time : null;
-        return { op: 'add', title, time };
-      }
-      case 'status':
-        return { op: 'status' };
-      default:
-        return null;
-    }
-  } catch (err) {
-    console.error(JSON.stringify({ evt: 'ai_interpret_failed', err: err instanceof Error ? err.message : String(err) }));
-    return null;
-  }
 }

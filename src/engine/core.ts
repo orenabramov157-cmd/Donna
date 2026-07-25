@@ -20,6 +20,8 @@ import {
   openTasks,
   outboundByMessageId,
   pendingPromptTask,
+  recentInboundTexts,
+  recentOutboundBodies,
   recentTrelloEcho,
   setOutboundStatus,
   setSetting,
@@ -45,7 +47,8 @@ import {
   utcForLocalDateTime,
   type LocalParts,
 } from '../time';
-import { aiInterpret, parseDeterministic, type Command, type NagLevel } from '../parse';
+import { parseDeterministic, type Command, type NagLevel } from '../parse';
+import { interpret, reflect, type BrainAction } from './brain';
 import { ladderStage } from './ladder';
 import { inQuietHours, nagPolicy, shouldPulse, shouldRenag } from './nag';
 import * as copy from './copy';
@@ -62,7 +65,7 @@ import {
 } from '../trello';
 import { getChannel, type Inbound } from '../channel';
 
-const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'misc'];
+const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'chat', 'misc'];
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
 
 interface Ctx {
@@ -263,35 +266,60 @@ async function dropTask(c: Ctx, t: TaskRow, reason?: string): Promise<void> {
   await sendOwner(c, 'receipt', copy.dropReceipt(t, reason), t.id);
 }
 
-async function addTask(c: Ctx, title: string, time: string | null): Promise<void> {
+type AddSpec = Extract<BrainAction, { type: 'add_task' }>;
+
+async function createTaskFromSpec(c: Ctx, spec: AddSpec): Promise<TaskRow | null> {
+  const startDate = spec.start_date ?? c.today;
+  let dueUtc: number | null = null;
+  if (spec.due_date) dueUtc = utcForLocalDateTime(c.tz, spec.due_date, spec.due_time ?? '17:00');
+  else if (spec.due_time) dueUtc = utcForLocalDateTime(c.tz, c.today, spec.due_time);
+
+  let remindAt: number | null = null;
+  if (spec.remind_time) remindAt = utcForLocalDateTime(c.tz, startDate, spec.remind_time);
+  else if (dueUtc && dueUtc - c.now < 24 * 3_600_000) remindAt = dueUtc - 60 * 60_000; // due soon → warn an hour out
+  if (remindAt !== null && remindAt <= c.now) remindAt = c.now + 5 * 60_000;
+
   let cardId: string | null = null;
   if (trelloConfigured(c.env)) {
     const todayListId = await getSetting(c.db, 'trello_today_list_id');
     if (todayListId) {
-      const dueIso = time ? new Date(utcForLocalDateTime(c.tz, c.today, time)).toISOString() : undefined;
-      const card = await createCard(c.env, todayListId, title, dueIso);
+      const card = await createCard(c.env, todayListId, spec.title, dueUtc ? new Date(dueUtc).toISOString() : undefined);
       if (card) {
         cardId = card.id;
-        await logOutbound(c.db, { kind: 'trello_create', trello_card_id: cardId, body: title });
+        await logOutbound(c.db, { kind: 'trello_create', trello_card_id: cardId, body: spec.title });
       }
     }
   }
-  let nextAt: number | null = null;
-  if (time) {
-    nextAt = utcForLocalDateTime(c.tz, c.today, time);
-    if (nextAt <= c.now) nextAt = utcForLocalDateTime(c.tz, addDaysLocal(c.tz, c.today, 1), time);
-  }
   const id = await createTask(c.db, {
     trello_card_id: cardId,
-    title,
-    source_local_date: c.today,
-    next_action_at_utc: nextAt,
+    title: spec.title,
+    source_local_date: startDate,
+    due_at_utc: dueUtc,
+    next_action_at_utc: remindAt,
     created_by: 'owner',
   });
   await appendEvent(c.db, id, 'created', { via: 'text' });
-  if (!nextAt) await updateTask(c.db, id, { pending_prompt: JSON.stringify({ type: 'add_time' }) });
-  const t = await getTask(c.db, id);
-  if (t) await sendOwner(c, 'receipt', copy.addReceipt(t, c.tz), id, cardId);
+  return getTask(c.db, id);
+}
+
+async function addTasksBatch(c: Ctx, specs: AddSpec[], overrideReply: string | null): Promise<void> {
+  const created: TaskRow[] = [];
+  for (const spec of specs) {
+    const t = await createTaskFromSpec(c, spec);
+    if (t) created.push(t);
+  }
+  if (created.length === 0) return;
+  const body = overrideReply ?? copy.multiAddReceipt(created, c.today, c.tz);
+  await sendOwner(c, 'receipt', body, created.length === 1 ? (created[0]?.id ?? null) : null);
+}
+
+// Deterministic `add: <task> [time]` path.
+async function addTask(c: Ctx, title: string, time: string | null): Promise<void> {
+  await addTasksBatch(
+    c,
+    [{ type: 'add_task', title, start_date: null, due_date: null, due_time: null, remind_time: time }],
+    null,
+  );
 }
 
 async function rewriteTask(c: Ctx, t: TaskRow, text: string, backToToday: boolean): Promise<void> {
@@ -393,6 +421,197 @@ async function clarify(c: Ctx): Promise<void> {
   const open = await openTasks(c.db, c.today);
   await saveStatusOrder(c, open);
   await sendOwner(c, 'receipt', copy.clarifyWhich(open, c.tz));
+}
+
+// -- conversational brain routing (v1.1) ------------------------------------
+
+function buildTranscript(
+  inbound: Array<{ at: number; body: string }>,
+  outbound: Array<{ at: number; body: string }>,
+  limit = 12,
+): string {
+  const merged = [
+    ...inbound.map((m) => ({ ...m, who: 'Owner' })),
+    ...outbound.map((m) => ({ ...m, who: 'Donna' })),
+  ]
+    .sort((a, b) => a.at - b.at)
+    .slice(-limit);
+  return merged.map((m) => `${m.who}: ${m.body.slice(0, 160)}`).join('\n');
+}
+
+async function setTaskTime(c: Ctx, t: TaskRow, time: string, date: string | null): Promise<void> {
+  const d = date ?? c.today;
+  let at = utcForLocalDateTime(c.tz, d, time);
+  if (at <= c.now && !date) at = utcForLocalDateTime(c.tz, addDaysLocal(c.tz, c.today, 1), time);
+  await saveUndo(c, t);
+  const fields: Record<string, string | number | null> = { next_action_at_utc: at, status: 'pending' };
+  if (date && date > c.today) fields.source_local_date = date;
+  await updateTask(c.db, t.id, fields);
+  await appendEvent(c.db, t.id, 'recommitted', { time, date: date ?? null });
+  await sendOwner(c, 'receipt', copy.recommitReceipt(t, copy.fmtLocalTime(at, c.tz)), t.id);
+}
+
+async function runBrainAction(c: Ctx, session: SessionRow, action: BrainAction, open: TaskRow[]): Promise<void> {
+  const byRef = (n: number): TaskRow | null => open[n - 1] ?? null;
+  switch (action.type) {
+    case 'complete': {
+      const t = byRef(action.task);
+      if (t) await completeTask(c, t, 'text');
+      else await clarify(c);
+      return;
+    }
+    case 'start': {
+      const t = byRef(action.task);
+      if (t) await startTask(c, t);
+      return;
+    }
+    case 'notdone': {
+      const t = byRef(action.task);
+      if (t) await notDoneTask(c, t);
+      return;
+    }
+    case 'snooze': {
+      const t = byRef(action.task);
+      if (t) await snoozeTask(c, t, action.minutes);
+      return;
+    }
+    case 'defer': {
+      const t = byRef(action.task);
+      if (t) await deferTask(c, t);
+      return;
+    }
+    case 'drop': {
+      const t = byRef(action.task);
+      if (t) await dropTask(c, t, action.reason ?? undefined);
+      return;
+    }
+    case 'blocked': {
+      const t = byRef(action.task);
+      if (t) await blockTask(c, t, action.reason);
+      return;
+    }
+    case 'set_time': {
+      const t = byRef(action.task);
+      if (t) await setTaskTime(c, t, action.time, action.date);
+      else await clarify(c);
+      return;
+    }
+    case 'status': {
+      const fresh = await openTasks(c.db, c.today);
+      await saveStatusOrder(c, fresh);
+      await sendOwner(c, 'receipt', copy.statusList(fresh, await doneTodayCount(c), c.tz));
+      return;
+    }
+    case 'plan':
+      await morningPrompt(c, session);
+      return;
+    case 'no_plan':
+      await updateSession(c.db, c.today, { plan_state: 'no_plan' });
+      await sendOwner(c, 'plan', copy.NO_PLAN);
+      return;
+    case 'confirm_plan':
+      await confirmPlan(c);
+      return;
+    case 'undo':
+      await tryUndo(c);
+      return;
+    case 'help':
+      await sendOwner(c, 'receipt', copy.HELP);
+      return;
+    case 'set_nag':
+      await updateUserField(c.db, 'nag_level', action.level);
+      await sendOwner(c, 'receipt', `Nag level: ${action.level}. 🫡`);
+      return;
+    default:
+      return;
+  }
+}
+
+async function brainRoute(c: Ctx, session: SessionRow, text: string): Promise<void> {
+  const open = await openTasks(c.db, c.today);
+  await saveStatusOrder(c, open);
+  const transcript = buildTranscript(await recentInboundTexts(c.db, 10), await recentOutboundBodies(c.db, 10));
+  const styleCard = await getSetting(c.db, 'style_card');
+  const schedInsights = await getSetting(c.db, 'sched_insights');
+  const result = await interpret(c.env, {
+    text,
+    tasks: open,
+    transcript,
+    parts: c.parts,
+    planState: session.plan_state,
+    styleCard: styleCard || null,
+    schedInsights: schedInsights || null,
+    todayLocal: c.today,
+    tz: c.tz,
+  });
+  if (!result) {
+    await sendOwner(c, 'chat', copy.CLARIFY_SIMPLE);
+    return;
+  }
+  if (result.actions.length === 0) {
+    await sendOwner(c, 'chat', result.question ?? result.reply ?? copy.CLARIFY_SIMPLE);
+    return;
+  }
+  const adds: AddSpec[] = [];
+  let executedOther = false;
+  for (const action of result.actions) {
+    if (action.type === 'add_task') {
+      adds.push(action);
+      continue;
+    }
+    executedOther = true;
+    await runBrainAction(c, session, action, open);
+  }
+  if (adds.length > 0) {
+    await addTasksBatch(c, adds, !executedOther && result.reply ? result.reply : null);
+  }
+}
+
+// -- nightly reflection (v1.2) ----------------------------------------------
+
+async function buildReflectionStats(c: Ctx): Promise<string> {
+  const events = await eventsInRange(c.db, c.now - 7 * 86_400_000, c.now + 1);
+  const completed = events.filter((e) => e.kind === 'completed');
+  const deferred = events.filter((e) => e.kind === 'deferred');
+  const dropped = events.filter((e) => e.kind === 'dropped');
+  const hourTally = new Map<number, number>();
+  for (const e of completed) {
+    const hh = localParts(e.at_utc, c.tz).hh;
+    hourTally.set(hh, (hourTally.get(hh) ?? 0) + 1);
+  }
+  const topHours = [...hourTally.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .map(([hh]) => `${hh}:00`);
+  const deferTally = new Map<number, number>();
+  for (const e of deferred) deferTally.set(e.task_id, (deferTally.get(e.task_id) ?? 0) + 1);
+  const worst = [...deferTally.entries()].sort((a, b) => b[1] - a[1])[0];
+  const worstTitle = worst ? ((await getTask(c.db, worst[0]))?.title ?? null) : null;
+  const bits = [
+    `last 7d: ${completed.length} completed, ${deferred.length} deferrals, ${dropped.length} dropped`,
+    topHours.length ? `completions cluster around ${topHours.join(' and ')}` : '',
+    worstTitle ? `most deferred: "${worstTitle}" (${worst?.[1]}x)` : '',
+  ];
+  return bits.filter(Boolean).join('; ');
+}
+
+async function nightlyReflection(c: Ctx): Promise<void> {
+  if ((await getSetting(c.db, 'reflect_date')) === c.today) return;
+  await setSetting(c.db, 'reflect_date', c.today); // one attempt per day, even on failure
+  const transcript = buildTranscript(await recentInboundTexts(c.db, 15), await recentOutboundBodies(c.db, 15), 20);
+  if (!transcript) return; // nothing to learn from yet
+  const stats = await buildReflectionStats(c);
+  const r = await reflect(c.env, c.today, {
+    transcript,
+    stats,
+    currentStyle: (await getSetting(c.db, 'style_card')) || null,
+    currentInsights: (await getSetting(c.db, 'sched_insights')) || null,
+  });
+  if (r) {
+    if (r.style) await setSetting(c.db, 'style_card', r.style);
+    if (r.insights) await setSetting(c.db, 'sched_insights', r.insights);
+    console.error(JSON.stringify({ evt: 'reflection_updated' }));
+  }
 }
 
 // -- morning plan -----------------------------------------------------------
@@ -515,16 +734,11 @@ async function routeText(c: Ctx, text: string): Promise<void> {
   const planning = session.plan_state === 'prompted' || session.plan_state === 'planning';
   if (planning && cmd.op === 'freetext' && (await planEdit(c, text))) return;
 
-  let effective: Command = cmd;
   if (cmd.op === 'freetext') {
-    const open = await openTasks(c.db, c.today);
-    const ai = await aiInterpret(c.env, c.today, text, open);
-    if (!ai) {
-      await sendOwner(c, 'receipt', copy.KEYWORDS_FALLBACK);
-      return;
-    }
-    effective = ai;
+    await brainRoute(c, session, text);
+    return;
   }
+  const effective: Command = cmd;
 
   switch (effective.op) {
     case 'ok':
@@ -561,11 +775,13 @@ async function routeText(c: Ctx, text: string): Promise<void> {
       await updateUserField(c.db, 'nag_level', effective.level as NagLevel);
       await sendOwner(c, 'receipt', `Nag level: ${effective.level}. 🫡`);
       return;
+    case 'resetmemory':
+      await setSetting(c.db, 'style_card', '');
+      await setSetting(c.db, 'sched_insights', '');
+      await sendOwner(c, 'receipt', copy.MEMORY_RESET);
+      return;
     case 'add':
       await addTask(c, effective.title, effective.time);
-      return;
-    case 'freetext':
-      await sendOwner(c, 'receipt', copy.KEYWORDS_FALLBACK);
       return;
     default:
       break;
@@ -849,6 +1065,7 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
     await sendOwner(c, 'recap', copy.eveningRecap(await buildRecap(c)));
     await updateSession(c.db, c.today, { recap_sent_at_utc: c.now });
     await weeklyIfDue(c, session);
+    await nightlyReflection(c);
   }
 
   // Durable-inbox sweep: rows the worker crashed on before marking processed

@@ -369,3 +369,31 @@ export async function lastInboundAt(db: D1Database): Promise<number | null> {
   const row = await db.prepare(`SELECT MAX(received_at_utc) AS t FROM inbound_events`).first<{ t: number | null }>();
   return row?.t ?? null;
 }
+
+// -- conversation transcript (for the brain) --------------------------------
+
+export async function recentOutboundBodies(db: D1Database, n = 12): Promise<Array<{ at: number; body: string }>> {
+  const res = await db
+    .prepare(`SELECT at_utc AS at, body FROM outbound_log WHERE status != 'failed' ORDER BY at_utc DESC LIMIT ?`)
+    .bind(n)
+    .all<{ at: number; body: string }>();
+  return res.results;
+}
+
+export async function recentInboundTexts(db: D1Database, n = 12): Promise<Array<{ at: number; body: string }>> {
+  const res = await db
+    .prepare(`SELECT received_at_utc AS at, raw FROM inbound_events ORDER BY received_at_utc DESC LIMIT ?`)
+    .bind(n * 2)
+    .all<{ at: number; raw: string }>();
+  const out: Array<{ at: number; body: string }> = [];
+  for (const row of res.results) {
+    try {
+      const parsed = JSON.parse(row.raw) as { kind?: string; text?: string };
+      if (parsed.kind === 'text' && typeof parsed.text === 'string') out.push({ at: row.at, body: parsed.text });
+    } catch {
+      // ignore unparseable rows
+    }
+    if (out.length >= n) break;
+  }
+  return out;
+}

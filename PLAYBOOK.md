@@ -102,3 +102,11 @@ Pure-logic units run in plain vitest: escalation ladder transitions, keyword gra
 
 - **Twilio SMS**: set `CHANNEL=twilio`, add the three Twilio secrets, point the Twilio number's webhook at `/webhook/loop/:token` (same route, adapter branches on parse). Documented in HANDOFF appendix.
 - **Multiple contacts** (e.g. cc the boss on the weekly recap): sandbox allows 5 contacts; `outbound_log` already records recipients.
+
+## 13. v1.1 "ears" + v1.2 "memory" (shipped 2026-07-24)
+
+**Conversational engine (`engine/brain.ts`).** Free-text messages route through one model call that returns a validated *list* of typed actions plus an optional in-character reply — so "gotta be at the meeting at 3, invoice by 5pm, and finish the deck this week" creates three tasks (each with its own remind time, deadline, or date) in one text. Every call is grounded with: the numbered open-task list, the last ~12 conversation turns, plan state, local date/time, and the learned profile cards. The model computes concrete dates ("this week" → a real `YYYY-MM-DD`); the engine validates everything (task bounds, time/date ranges, past-date clamping — see `validateInterpretation`, unit-tested) and remains the only thing that mutates state. Tasks due within 24h get an automatic warn-one-hour-early nag. When unsure, Donna asks one short specific question — never a command dump. Deterministic keywords remain as instant, zero-AI shortcuts and as the fallback when the AI budget is exhausted.
+
+**Learning loop.** Donna's append-only history is now read back nightly: after the evening recap, a reflection job distills (a) deterministic stats — completions by hour, deferral leaders, 7-day counts — and (b) an AI-refreshed pair of profile cards stored in `settings`: `style_card` (how the owner texts and what tone lands) and `sched_insights` (behavioral patterns with numbers). Both cards are injected into every subsequent interpretation and reply, so her scheduling proposals and voice drift toward the owner's reality. `reset memory` wipes both cards. The model never retrains; "learning" is memory + retrieval by design — state stays deterministic and auditable.
+
+**Cost:** unchanged — one interpret call per free-text message plus one reflection call per day, inside the existing `AI_DAILY_CAP` on the free Workers AI allocation.

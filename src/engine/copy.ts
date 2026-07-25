@@ -179,3 +179,25 @@ export function stuckReview(tasks: TaskRow[]): string {
 
 export const SETUP_TEST = `🔧 Test message from your accountability bot — you're wired up. Text "help" to see commands.`;
 export const KEYWORDS_FALLBACK = `Didn't catch that. ${'\n'}${HELP}`;
+export const CLARIFY_SIMPLE = `Lost you for a sec — run that by me again with times? (like "invoice by 5pm, deck by Friday")`;
+export const MEMORY_RESET = `🧠 Wiped everything I'd learned about you. Fresh start.`;
+
+export function fmtLocalDay(utcMs: number, tz: string): string {
+  return new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', month: 'short', day: 'numeric' }).format(
+    new Date(utcMs),
+  );
+}
+
+export function multiAddReceipt(tasks: TaskRow[], todayLocal: string, tz: string): string {
+  const lines = tasks.map((t, i) => {
+    const bits: string[] = [];
+    if (t.source_local_date > todayLocal) bits.push(`starts ${t.source_local_date}`);
+    if (t.due_at_utc) {
+      const sameDay = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date(t.due_at_utc)) === todayLocal;
+      bits.push(`due ${sameDay ? fmtLocalTime(t.due_at_utc, tz) : fmtLocalDay(t.due_at_utc, tz)}`);
+    }
+    if (t.next_action_at_utc) bits.push(`I come knocking ${fmtLocalTime(t.next_action_at_utc, tz)}`);
+    return `${i + 1}) ${t.title}${bits.length ? ' — ' + bits.join(', ') : ''}`;
+  });
+  return [`➕ Locked in:`, ...lines, `On it. 🫡`].join('\n');
+}
