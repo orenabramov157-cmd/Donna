@@ -258,6 +258,7 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     `- A deadline ("by 5pm", "due Friday", "by end of week") → due_time/due_date (or due_in_minutes for "due in 2 hours"). "by 5pm"→due_time:"17:00". "this week"→due_date=this Friday.`,
     `- If they give a do-it time but no separate nag time, set remind_time to that time. If only a deadline, leave remind fields null (the system warns before it).`,
     `Rules:`,
+    `- Texting shorthand is normal English — read it naturally, never as a task title: u=you, ur/yr=your, r=are, rn=right now, tn=tonight, tmrw/tmr=tomorrow, td=today, lmk=let me know, alr/aight/ight=alright, k/kk=ok, w/e=whatever, b4=before, ngl/idk/imo as usual.`,
     `- Match tasks by meaning ("the deck" = whichever open task is about the deck).`,
     `- NEVER ask the owner a clarifying question. If unsure which task, pick the most likely one. If unsure of a time, make a sensible assumption and just state it in "reply". Act, don't interrogate.`,
     `- Pure conversation with no task operation → actions=[] and a short "reply" in their style.`,

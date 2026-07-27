@@ -69,7 +69,12 @@ export function parseDeterministic(raw: string): Command {
   if ((m = /^nag\s+(gentle|standard|relentless)$/i.exec(t))) {
     return { op: 'naglevel', level: m[1] as NagLevel };
   }
-  if (/^(?:ok|okay|yes|yep|yeah|approve[d]?|confirm(?:ed)?|looks good|lgtm|👍)[.!]*$/i.test(t)) return { op: 'ok' };
+  if (
+    /^(?:ok|okay|k|kk|yes|yep|yup|ya|yeah|yah|sure|aight|ight|alright|alr|bet|word|sounds good|looks good|lgtm|approve[d]?|confirm(?:ed)?|👍)[.!]*$/i.test(
+      t,
+    )
+  )
+    return { op: 'ok' };
 
   return { op: 'freetext', text };
 }

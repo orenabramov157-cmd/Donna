@@ -48,6 +48,12 @@ describe('deterministic grammar', () => {
 
   it('ok', () => expect(parseDeterministic('ok')).toEqual({ op: 'ok' }));
   it('looks good', () => expect(parseDeterministic('looks good')).toEqual({ op: 'ok' }));
+  it('aight (his register)', () => expect(parseDeterministic('aight')).toEqual({ op: 'ok' }));
+  it('alr', () => expect(parseDeterministic('alr')).toEqual({ op: 'ok' }));
+  it('bet', () => expect(parseDeterministic('bet')).toEqual({ op: 'ok' }));
+  it('k', () => expect(parseDeterministic('k')).toEqual({ op: 'ok' }));
+  it('"u" alone stays freetext for the brain', () =>
+    expect(parseDeterministic('u up?')).toMatchObject({ op: 'freetext' }));
 
   it('prose falls through to freetext', () => {
     expect(parseDeterministic('finished the photos and sent the invoice')).toEqual({
