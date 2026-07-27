@@ -7,9 +7,9 @@ describe('validateInterpretation', () => {
   it('parses a multi-task add from one message', () => {
     const raw = JSON.stringify({
       actions: [
-        { type: 'add_task', title: 'team meeting', start_date: null, due_date: null, due_time: null, remind_time: '15:00' },
-        { type: 'add_task', title: 'send invoice', start_date: null, due_date: null, due_time: '17:00', remind_time: null },
-        { type: 'add_task', title: 'finish the deck', start_date: null, due_date: '2026-07-26', due_time: null, remind_time: null },
+        { type: 'add_task', title: 'team meeting', remind_time: '15:00' },
+        { type: 'add_task', title: 'send invoice', due_time: '17:00' },
+        { type: 'add_task', title: 'finish the deck', due_date: '2026-07-26' },
       ],
       reply: 'Got all three. Meeting at 3, invoice by 5, deck by Sunday.',
       question: null,
@@ -22,6 +22,28 @@ describe('validateInterpretation', () => {
     expect(r!.actions[1]).toMatchObject({ type: 'add_task', due_time: '17:00' });
     expect(r!.actions[2]).toMatchObject({ type: 'add_task', due_date: '2026-07-26' });
     expect(r!.reply).toContain('all three');
+  });
+
+  it('captures a relative reminder offset (the 24h→5min bug)', () => {
+    const raw = JSON.stringify({
+      actions: [{ type: 'add_task', title: 'renew registration', remind_in_minutes: 1440 }],
+      reply: null,
+      question: null,
+      confidence: 0.9,
+    });
+    const r = validateInterpretation(raw, 0, TODAY);
+    expect(r!.actions[0]).toMatchObject({ type: 'add_task', remind_in_minutes: 1440, remind_time: null });
+  });
+
+  it('rejects absurd offsets but keeps the task', () => {
+    const raw = JSON.stringify({
+      actions: [{ type: 'add_task', title: 'x', remind_in_minutes: 0, due_in_minutes: 9_999_999 }],
+      reply: null,
+      question: null,
+      confidence: 0.9,
+    });
+    const r = validateInterpretation(raw, 0, TODAY);
+    expect(r!.actions[0]).toMatchObject({ title: 'x', remind_in_minutes: null, due_in_minutes: null });
   });
 
   it('extracts JSON wrapped in prose', () => {
@@ -44,20 +66,20 @@ describe('validateInterpretation', () => {
     expect(r!.actions).toEqual([{ type: 'complete', task: 1 }]);
   });
 
-  it('clamps past dates to today', () => {
+  it('clamps past due dates to today', () => {
     const raw = JSON.stringify({
-      actions: [{ type: 'add_task', title: 'x', start_date: '2020-01-01', due_date: '2026-07-20', due_time: null, remind_time: null }],
+      actions: [{ type: 'add_task', title: 'x', due_date: '2026-07-20', due_time: null, remind_time: null }],
       reply: null,
       question: null,
       confidence: 0.8,
     });
     const r = validateInterpretation(raw, 0, TODAY);
-    expect(r!.actions[0]).toMatchObject({ start_date: TODAY, due_date: TODAY });
+    expect(r!.actions[0]).toMatchObject({ due_date: TODAY });
   });
 
   it('rejects malformed times and keeps the task', () => {
     const raw = JSON.stringify({
-      actions: [{ type: 'add_task', title: 'call sam', start_date: null, due_date: null, due_time: '5pm', remind_time: '25:99' }],
+      actions: [{ type: 'add_task', title: 'call sam', due_time: '5pm', remind_time: '25:99' }],
       reply: null,
       question: null,
       confidence: 0.8,

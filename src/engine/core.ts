@@ -268,16 +268,40 @@ async function dropTask(c: Ctx, t: TaskRow, reason?: string): Promise<void> {
 
 type AddSpec = Extract<BrainAction, { type: 'add_task' }>;
 
-async function createTaskFromSpec(c: Ctx, spec: AddSpec): Promise<TaskRow | null> {
-  const startDate = spec.start_date ?? c.today;
-  let dueUtc: number | null = null;
-  if (spec.due_date) dueUtc = utcForLocalDateTime(c.tz, spec.due_date, spec.due_time ?? '17:00');
-  else if (spec.due_time) dueUtc = utcForLocalDateTime(c.tz, c.today, spec.due_time);
+// Resolve a deadline to a concrete UTC instant. Relative offset wins; then an
+// absolute date (+time, default 5pm); then a bare time today.
+function resolveDue(c: Ctx, spec: AddSpec): number | null {
+  if (spec.due_in_minutes !== null) return c.now + spec.due_in_minutes * 60_000;
+  if (spec.due_date) return utcForLocalDateTime(c.tz, spec.due_date, spec.due_time ?? '17:00');
+  if (spec.due_time) {
+    let at = utcForLocalDateTime(c.tz, c.today, spec.due_time);
+    if (at <= c.now) at = utcForLocalDateTime(c.tz, addDaysLocal(c.tz, c.today, 1), spec.due_time); // 5pm already gone → tomorrow 5pm
+    return at;
+  }
+  return null;
+}
 
-  let remindAt: number | null = null;
-  if (spec.remind_time) remindAt = utcForLocalDateTime(c.tz, startDate, spec.remind_time);
-  else if (dueUtc && dueUtc - c.now < 24 * 3_600_000) remindAt = dueUtc - 60 * 60_000; // due soon → warn an hour out
-  if (remindAt !== null && remindAt <= c.now) remindAt = c.now + 5 * 60_000;
+// Resolve the first-nag time. Relative offset is trusted as-is (this is the
+// fix for "in 24 hours" — 1440 min from now, NOT a clock time that collapses
+// to the past). Absolute date/time rolls to tomorrow if already past today.
+function resolveRemind(c: Ctx, spec: AddSpec, dueUtc: number | null): number | null {
+  if (spec.remind_in_minutes !== null) return c.now + spec.remind_in_minutes * 60_000;
+  if (spec.remind_date) return utcForLocalDateTime(c.tz, spec.remind_date, spec.remind_time ?? '09:00');
+  if (spec.remind_time) {
+    let at = utcForLocalDateTime(c.tz, c.today, spec.remind_time);
+    if (at <= c.now) at = utcForLocalDateTime(c.tz, addDaysLocal(c.tz, c.today, 1), spec.remind_time);
+    return at;
+  }
+  if (dueUtc && dueUtc - c.now < 24 * 3_600_000) return Math.max(c.now + 60_000, dueUtc - 60 * 60_000); // due soon → warn an hour out
+  return null;
+}
+
+async function createTaskFromSpec(c: Ctx, spec: AddSpec): Promise<TaskRow | null> {
+  const dueUtc = resolveDue(c, spec);
+  let remindAt = resolveRemind(c, spec, dueUtc);
+  // Only a tiny guard against processing lag — never the old 5-minute snap.
+  if (remindAt !== null && remindAt <= c.now) remindAt = c.now + 60_000;
+  const startDate = remindAt ? localParts(remindAt, c.tz).localDate : c.today;
 
   let cardId: string | null = null;
   if (trelloConfigured(c.env)) {
@@ -302,24 +326,24 @@ async function createTaskFromSpec(c: Ctx, spec: AddSpec): Promise<TaskRow | null
   return getTask(c.db, id);
 }
 
-async function addTasksBatch(c: Ctx, specs: AddSpec[], overrideReply: string | null): Promise<void> {
+// Always sends a short, deterministic confirmation of exactly what was
+// logged (tasks + times) — never the model's terse "reply" — so a success is
+// unmistakable and correctable at a glance.
+async function addTasksBatch(c: Ctx, specs: AddSpec[]): Promise<void> {
   const created: TaskRow[] = [];
   for (const spec of specs) {
     const t = await createTaskFromSpec(c, spec);
     if (t) created.push(t);
   }
   if (created.length === 0) return;
-  const body = overrideReply ?? copy.multiAddReceipt(created, c.today, c.tz);
-  await sendOwner(c, 'receipt', body, created.length === 1 ? (created[0]?.id ?? null) : null);
+  await sendOwner(c, 'receipt', copy.multiAddReceipt(created, c.today, c.tz), created.length === 1 ? (created[0]?.id ?? null) : null);
 }
 
 // Deterministic `add: <task> [time]` path.
 async function addTask(c: Ctx, title: string, time: string | null): Promise<void> {
-  await addTasksBatch(
-    c,
-    [{ type: 'add_task', title, start_date: null, due_date: null, due_time: null, remind_time: time }],
-    null,
-  );
+  await addTasksBatch(c, [
+    { type: 'add_task', title, due_date: null, due_time: null, due_in_minutes: null, remind_date: null, remind_time: time, remind_in_minutes: null },
+  ]);
 }
 
 async function rewriteTask(c: Ctx, t: TaskRow, text: string, backToToday: boolean): Promise<void> {
@@ -545,26 +569,22 @@ async function brainRoute(c: Ctx, session: SessionRow, text: string): Promise<vo
     tz: c.tz,
   });
   if (!result) {
-    await sendOwner(c, 'chat', copy.CLARIFY_SIMPLE);
+    // Rare now (parsing is retried + shape-tolerant). Never interrogate —
+    // acknowledge and move on; the reflection loop still sees the message.
+    await sendOwner(c, 'chat', copy.SOFT_ACK);
     return;
   }
   if (result.actions.length === 0) {
-    await sendOwner(c, 'chat', result.question ?? result.reply ?? copy.CLARIFY_SIMPLE);
+    // Pure conversation. Reply in her learned voice; never ask a question.
+    await sendOwner(c, 'chat', result.reply ?? copy.SOFT_ACK);
     return;
   }
   const adds: AddSpec[] = [];
-  let executedOther = false;
   for (const action of result.actions) {
-    if (action.type === 'add_task') {
-      adds.push(action);
-      continue;
-    }
-    executedOther = true;
-    await runBrainAction(c, session, action, open);
+    if (action.type === 'add_task') adds.push(action);
+    else await runBrainAction(c, session, action, open);
   }
-  if (adds.length > 0) {
-    await addTasksBatch(c, adds, !executedOther && result.reply ? result.reply : null);
-  }
+  if (adds.length > 0) await addTasksBatch(c, adds);
 }
 
 // -- nightly reflection (v1.2) ----------------------------------------------
@@ -593,6 +613,21 @@ async function buildReflectionStats(c: Ctx): Promise<string> {
     worstTitle ? `most deferred: "${worstTitle}" (${worst?.[1]}x)` : '',
   ];
   return bits.filter(Boolean).join('; ');
+}
+
+// Same-day first learning: once she has a little material, run one reflection
+// before the first evening so adaptation is visible on day one instead of
+// after a full night.
+async function maybeEarlySeed(c: Ctx): Promise<void> {
+  if (await getSetting(c.db, 'seed_done')) return;
+  if (await getSetting(c.db, 'style_card')) {
+    await setSetting(c.db, 'seed_done', '1');
+    return;
+  }
+  const inbound = await recentInboundTexts(c.db, 8);
+  if (inbound.length < 6) return;
+  await setSetting(c.db, 'seed_done', '1');
+  await nightlyReflection(c);
 }
 
 async function nightlyReflection(c: Ctx): Promise<void> {
@@ -1066,6 +1101,8 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
     await updateSession(c.db, c.today, { recap_sent_at_utc: c.now });
     await weeklyIfDue(c, session);
     await nightlyReflection(c);
+  } else if (!quiet) {
+    await maybeEarlySeed(c);
   }
 
   // Durable-inbox sweep: rows the worker crashed on before marking processed

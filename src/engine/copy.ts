@@ -179,7 +179,7 @@ export function stuckReview(tasks: TaskRow[]): string {
 
 export const SETUP_TEST = `🔧 Test message from your accountability bot — you're wired up. Text "help" to see commands.`;
 export const KEYWORDS_FALLBACK = `Didn't catch that. ${'\n'}${HELP}`;
-export const CLARIFY_SIMPLE = `Lost you for a sec — run that by me again with times? (like "invoice by 5pm, deck by Friday")`;
+export const SOFT_ACK = `ugh that one didn't land for me — hit me with it again?`;
 export const MEMORY_RESET = `🧠 Wiped everything I'd learned about you. Fresh start.`;
 
 export function fmtLocalDay(utcMs: number, tz: string): string {
@@ -188,16 +188,32 @@ export function fmtLocalDay(utcMs: number, tz: string): string {
   );
 }
 
+function fmtLocalDate(utcMs: number, tz: string): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date(utcMs));
+}
+
+// Time only when it's today; day + time otherwise (so "tomorrow 6:32 PM"
+// never shows as a bare "6:32 PM" the owner can't place).
+function whenLabel(utcMs: number, todayLocal: string, tz: string): string {
+  return fmtLocalDate(utcMs, tz) === todayLocal
+    ? fmtLocalTime(utcMs, tz)
+    : `${fmtLocalDay(utcMs, tz)} ${fmtLocalTime(utcMs, tz)}`;
+}
+
+function taskWhen(t: TaskRow, todayLocal: string, tz: string): string {
+  const parts: string[] = [];
+  if (t.next_action_at_utc) parts.push(`nagging you ${whenLabel(t.next_action_at_utc, todayLocal, tz)}`);
+  if (t.due_at_utc) parts.push(`due ${whenLabel(t.due_at_utc, todayLocal, tz)}`);
+  return parts.length ? parts.join(', ') : `no time set — tell me when to chase you`;
+}
+
 export function multiAddReceipt(tasks: TaskRow[], todayLocal: string, tz: string): string {
-  const lines = tasks.map((t, i) => {
-    const bits: string[] = [];
-    if (t.source_local_date > todayLocal) bits.push(`starts ${t.source_local_date}`);
-    if (t.due_at_utc) {
-      const sameDay = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date(t.due_at_utc)) === todayLocal;
-      bits.push(`due ${sameDay ? fmtLocalTime(t.due_at_utc, tz) : fmtLocalDay(t.due_at_utc, tz)}`);
-    }
-    if (t.next_action_at_utc) bits.push(`I come knocking ${fmtLocalTime(t.next_action_at_utc, tz)}`);
-    return `${i + 1}) ${t.title}${bits.length ? ' — ' + bits.join(', ') : ''}`;
-  });
-  return [`➕ Locked in:`, ...lines, `On it. 🫡`].join('\n');
+  if (tasks.length === 1) {
+    const t = tasks[0];
+    if (!t) return `✅ Got it.`;
+    const when = taskWhen(t, todayLocal, tz);
+    return `✅ Got it — ${t.title}. ${when.charAt(0).toUpperCase()}${when.slice(1)}.`;
+  }
+  const lines = tasks.map((t, i) => `${i + 1}) ${t.title} — ${taskWhen(t, todayLocal, tz)}`);
+  return [`✅ Locked in ${tasks.length}:`, ...lines, `On it. 🫡`].join('\n');
 }

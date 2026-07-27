@@ -16,10 +16,14 @@ export type BrainAction =
   | {
       type: 'add_task';
       title: string;
-      start_date: string | null; // when Donna starts caring (default today)
-      due_date: string | null; // hard deadline day
-      due_time: string | null; // HH:MM on the deadline day
-      remind_time: string | null; // HH:MM today to first nag
+      // Deadline — absolute (date + optional time) or relative offset.
+      due_date: string | null;
+      due_time: string | null;
+      due_in_minutes: number | null;
+      // First nag — absolute (date + time) or relative offset from now.
+      remind_date: string | null;
+      remind_time: string | null;
+      remind_in_minutes: number | null;
     }
   | { type: 'complete'; task: number }
   | { type: 'start'; task: number }
@@ -67,6 +71,14 @@ function validTime(v: unknown): string | null {
   return hh < 24 && mm < 60 ? s : null;
 }
 
+// Relative offset in minutes, 1 min .. 60 days. Guards against the model
+// emitting nonsense like 0 or a year of minutes.
+function validOffset(v: unknown): number | null {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  const n = Math.round(v);
+  return n >= 1 && n <= 86_400 ? n : null;
+}
+
 function taskRef(v: unknown, taskCount: number): number | null {
   return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= taskCount ? v : null;
 }
@@ -95,10 +107,12 @@ export function validateInterpretation(rawText: string, taskCount: number, today
         actions.push({
           type: 'add_task',
           title: title.slice(0, 200),
-          start_date: clampDate(str(a.start_date), todayLocal),
           due_date: clampDate(str(a.due_date), todayLocal),
           due_time: validTime(a.due_time),
+          due_in_minutes: validOffset(a.due_in_minutes),
+          remind_date: clampDate(str(a.remind_date), todayLocal),
           remind_time: validTime(a.remind_time),
+          remind_in_minutes: validOffset(a.remind_in_minutes),
         });
         break;
       }
@@ -225,8 +239,9 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
 
   const system = [
     `You are Donna, a personal accountability agent who texts with her owner. Voice: brief, direct, warm but blunt — never corporate, never listy unless asked. Mirror how the owner texts.`,
-    input.styleCard ? `WHAT YOU KNOW ABOUT HOW THE OWNER TALKS:\n${input.styleCard}` : '',
-    input.schedInsights ? `WHAT YOU KNOW ABOUT THE OWNER'S PATTERNS:\n${input.schedInsights}` : '',
+    input.styleCard ? `WHO YOU'RE TALKING TO (mirror this — how they talk and how they want you to talk back):\n${input.styleCard}` : '',
+    input.schedInsights ? `WHAT YOU KNOW ABOUT THEIR PATTERNS:\n${input.schedInsights}` : '',
+    `Timezone: ${input.tz}. ALL times are in this local zone — "5pm" means 17:00 ${input.tz}, never UTC.`,
     `Now: ${input.parts.weekday} ${input.todayLocal}, ${input.parts.hhmm} local. Plan state today: ${input.planState}.`,
     `Open tasks (always reference by number):\n${taskListForPrompt(input.tasks, input.tz)}`,
     `Recent conversation:\n${input.transcript || '(none)'}`,
@@ -234,16 +249,20 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     `Convert the owner's NEW message into JSON ONLY (no prose outside JSON):`,
     `{"actions":[...],"reply":"..." or null,"question":"..." or null,"confidence":0.0-1.0}`,
     `Action types:`,
-    `{"type":"add_task","title":str,"start_date":"YYYY-MM-DD"|null,"due_date":"YYYY-MM-DD"|null,"due_time":"HH:MM"|null,"remind_time":"HH:MM"|null} — extract EVERY task mentioned, one action each. Compute concrete dates from today's date ("this week"→this Friday, "tonight"→today). "by 5pm" means due_time "17:00" today. remind_time = when to first nag if they named a time to do it.`,
+    `{"type":"add_task","title":str,"due_date":"YYYY-MM-DD"|null,"due_time":"HH:MM"|null,"due_in_minutes":int|null,"remind_date":"YYYY-MM-DD"|null,"remind_time":"HH:MM"|null,"remind_in_minutes":int|null} — extract EVERY task mentioned, one action each.`,
     `{"type":"complete","task":n} {"type":"start","task":n} {"type":"notdone","task":n} {"type":"snooze","task":n,"minutes":m} {"type":"defer","task":n} {"type":"drop","task":n,"reason":str|null} {"type":"blocked","task":n,"reason":str} {"type":"set_time","task":n,"time":"HH:MM","date":"YYYY-MM-DD"|null}`,
     `{"type":"status"} {"type":"plan"} {"type":"no_plan"} {"type":"confirm_plan"} {"type":"undo"} {"type":"help"} {"type":"set_nag","level":"gentle|standard|relentless"}`,
+    `TIME RULES (critical — get these exactly right):`,
+    `- "remind me in X" / "in X minutes|hours|days" → use remind_in_minutes ONLY (minutes=5, hours×60, days×1440). Example: "in 24 hours"→remind_in_minutes:1440. "in 3 days"→4320. NEVER convert a relative offset into a clock time.`,
+    `- A clock time to be nagged ("nag me at 3pm", "remind me at 10am tomorrow") → remind_time (+remind_date if a day is named). "tomorrow 10am"→remind_date=tomorrow's date, remind_time:"10:00".`,
+    `- A deadline ("by 5pm", "due Friday", "by end of week") → due_time/due_date (or due_in_minutes for "due in 2 hours"). "by 5pm"→due_time:"17:00". "this week"→due_date=this Friday.`,
+    `- If they give a do-it time but no separate nag time, set remind_time to that time. If only a deadline, leave remind fields null (the system warns before it).`,
     `Rules:`,
-    `- Relative times: "in 5 minutes" / "in an hour" → add to the current local time (${input.parts.hhmm}) and output the resulting HH:MM as remind_time.`,
     `- Match tasks by meaning ("the deck" = whichever open task is about the deck).`,
-    `- If the message is conversation with no task operation, actions=[] and write "reply" in the owner's style (<=300 chars).`,
-    `- If you genuinely can't tell which task or what time, actions=[] and ask ONE short specific "question". Never dump a command list.`,
-    `- When actions exist, "reply" should be one short confirmation in the owner's style; the system may use it instead of its own receipt.`,
-    `- Low confidence (<0.5) if you're guessing.`,
+    `- NEVER ask the owner a clarifying question. If unsure which task, pick the most likely one. If unsure of a time, make a sensible assumption and just state it in "reply". Act, don't interrogate.`,
+    `- Pure conversation with no task operation → actions=[] and a short "reply" in their style.`,
+    `- "question" must always be null. Use "reply" instead.`,
+    `- confidence <0.5 only if you truly cannot act at all.`,
   ]
     .filter(Boolean)
     .join('\n');
@@ -305,8 +324,8 @@ export async function reflect(
 ): Promise<{ style: string; insights: string } | null> {
   if (!(await aiBudgetOk(env, todayLocal))) return null;
   const system = [
-    `You maintain two short memory cards about the owner of an accountability bot. Rewrite both, merging what was already known with today's new evidence. Be concrete and factual; no psychoanalysis.`,
-    `Card 1 STYLE (<=300 chars): how the owner texts (length, slang, punctuation, emoji) and what tone gets responses from them.`,
+    `You maintain two short memory cards about the owner of an accountability bot named Donna. Rewrite both, merging what was already known with today's new evidence. Be concrete and factual; no psychoanalysis.`,
+    `Card 1 STYLE (<=300 chars): (a) how the owner texts — length, slang, punctuation, emoji, capitalization; AND (b) the DYNAMIC they want from Donna, inferred from how they talk to her and what they respond to: do they want a boss / drill-sergeant who pushes hard, or a chill helper? Blunt or gentle? Hype or deadpan? Write it as a directive Donna can follow (e.g. "Texts lowercase, short, casual/profane; wants a blunt hype drill-sergeant, not a soft assistant. Match his energy, don't be corporate.").`,
     `Card 2 INSIGHTS (<=300 chars): schedule/behavior patterns with numbers when possible (when they actually do work, what they defer, response lag).`,
     `Existing STYLE: ${input.currentStyle ?? '(none yet)'}`,
     `Existing INSIGHTS: ${input.currentInsights ?? '(none yet)'}`,
