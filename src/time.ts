@@ -120,6 +120,19 @@ export function parseTimeToken(raw: string): string | null {
   return null;
 }
 
+// Pull a standalone relative day-word ("tomorrow", "tmrw", "today", "tonight")
+// out of free text so the deterministic add: path schedules the right day
+// instead of leaving "tmrw" glued to the title and defaulting to today.
+// Possessives like "tomorrow's meeting" are deliberately left intact.
+export function extractDayWord(text: string): { rest: string; daysAhead: number } {
+  const m = /(?:^|\s)(today|tonight|tomorrow|tmrw|tmr)(?=$|\s|[.,!?])/i.exec(text);
+  if (!m) return { rest: text.trim(), daysAhead: 0 };
+  const w = (m[1] ?? '').toLowerCase();
+  const daysAhead = w === 'tomorrow' || w === 'tmrw' || w === 'tmr' ? 1 : 0;
+  const rest = (text.slice(0, m.index) + ' ' + text.slice(m.index + m[0].length)).replace(/\s+/g, ' ').trim();
+  return { rest, daysAhead };
+}
+
 // Pull a trailing time expression off free text: "call vendor 10am" ->
 // { title: "call vendor", time: "10:00" }
 export function extractTrailingTime(text: string): { title: string; time: string | null } {

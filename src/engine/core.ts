@@ -339,10 +339,11 @@ async function addTasksBatch(c: Ctx, specs: AddSpec[]): Promise<void> {
   await sendOwner(c, 'receipt', copy.multiAddReceipt(created, c.today, c.tz), created.length === 1 ? (created[0]?.id ?? null) : null);
 }
 
-// Deterministic `add: <task> [time]` path.
-async function addTask(c: Ctx, title: string, time: string | null): Promise<void> {
+// Deterministic `add: <task> [today|tomorrow] [time]` path.
+async function addTask(c: Ctx, title: string, time: string | null, daysAhead = 0): Promise<void> {
+  const remind_date = daysAhead > 0 ? addDaysLocal(c.tz, c.today, daysAhead) : null;
   await addTasksBatch(c, [
-    { type: 'add_task', title, due_date: null, due_time: null, due_in_minutes: null, remind_date: null, remind_time: time, remind_in_minutes: null },
+    { type: 'add_task', title, due_date: null, due_time: null, due_in_minutes: null, remind_date, remind_time: time, remind_in_minutes: null },
   ]);
 }
 
@@ -816,7 +817,7 @@ async function routeText(c: Ctx, text: string): Promise<void> {
       await sendOwner(c, 'receipt', copy.MEMORY_RESET);
       return;
     case 'add':
-      await addTask(c, effective.title, effective.time);
+      await addTask(c, effective.title, effective.time, 'daysAhead' in effective ? (effective.daysAhead ?? 0) : 0);
       return;
     default:
       break;

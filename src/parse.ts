@@ -4,7 +4,7 @@
 
 import type { AppEnv } from './env';
 import { getSetting, setSetting } from './db';
-import { extractTrailingTime } from './time';
+import { extractDayWord, extractTrailingTime } from './time';
 
 export type NagLevel = 'gentle' | 'standard' | 'relentless';
 
@@ -16,7 +16,7 @@ export type Command =
   | { op: 'notdone'; taskRef?: number }
   | { op: 'blocked'; reason: string; taskRef?: number }
   | { op: 'drop'; taskRef?: number; reason?: string }
-  | { op: 'add'; title: string; time: string | null }
+  | { op: 'add'; title: string; time: string | null; daysAhead?: number }
   | { op: 'plan' }
   | { op: 'noplan' }
   | { op: 'status' }
@@ -56,8 +56,9 @@ export function parseDeterministic(raw: string): Command {
     return { op: 'drop', taskRef: refNum(m[1]), ...(reason ? { reason } : {}) };
   }
   if ((m = /^add[:\s]\s*(.+)$/i.exec(text))) {
-    const { title, time } = extractTrailingTime(m[1] ?? '');
-    return { op: 'add', title, time };
+    const { rest, daysAhead } = extractDayWord(m[1] ?? '');
+    const { title, time } = extractTrailingTime(rest);
+    return { op: 'add', title, time, ...(daysAhead ? { daysAhead } : {}) };
   }
   if (/^plan[.!]*$/i.test(t)) return { op: 'plan' };
   if (/^no\s*plan(?:\s*today)?[.!]*$/i.test(t)) return { op: 'noplan' };

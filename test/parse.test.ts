@@ -37,6 +37,15 @@ describe('deterministic grammar', () => {
     expect(parseDeterministic('add: call the vendor 10am')).toEqual({ op: 'add', title: 'call the vendor', time: '10:00' }));
   it('add without time', () =>
     expect(parseDeterministic('add: think about strategy')).toEqual({ op: 'add', title: 'think about strategy', time: null }));
+  it('add with "tmrw" + time schedules tomorrow, clean title', () =>
+    expect(parseDeterministic('add: send the invoice tmrw 2pm')).toEqual({
+      op: 'add',
+      title: 'send the invoice',
+      time: '14:00',
+      daysAhead: 1,
+    }));
+  it('add "tomorrow" no time', () =>
+    expect(parseDeterministic('add: call mom tomorrow')).toEqual({ op: 'add', title: 'call mom', time: null, daysAhead: 1 }));
 
   it('plan', () => expect(parseDeterministic('plan')).toEqual({ op: 'plan' }));
   it('status', () => expect(parseDeterministic('status')).toEqual({ op: 'status' }));

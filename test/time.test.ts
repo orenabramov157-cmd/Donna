@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   addDaysLocal,
+  extractDayWord,
   extractTrailingTime,
   inWindow,
   localParts,
@@ -80,5 +81,24 @@ describe('extractTrailingTime', () => {
   });
   it('no time', () => {
     expect(extractTrailingTime('think about strategy')).toEqual({ title: 'think about strategy', time: null });
+  });
+});
+
+describe('extractDayWord', () => {
+  it('strips a mid-string "tmrw" and marks tomorrow', () => {
+    expect(extractDayWord('send the invoice tmrw 2pm')).toEqual({ rest: 'send the invoice 2pm', daysAhead: 1 });
+  });
+  it('tomorrow at the front', () => {
+    expect(extractDayWord('tomorrow call the vendor')).toEqual({ rest: 'call the vendor', daysAhead: 1 });
+  });
+  it('today / tonight are day 0 but still stripped from the title', () => {
+    expect(extractDayWord('gym tonight 6pm')).toEqual({ rest: 'gym 6pm', daysAhead: 0 });
+    expect(extractDayWord('pay rent today')).toEqual({ rest: 'pay rent', daysAhead: 0 });
+  });
+  it('leaves possessives like "tomorrow\'s" intact', () => {
+    expect(extractDayWord("prep tomorrow's deck")).toEqual({ rest: "prep tomorrow's deck", daysAhead: 0 });
+  });
+  it('no day word', () => {
+    expect(extractDayWord('finish the reel')).toEqual({ rest: 'finish the reel', daysAhead: 0 });
   });
 });
