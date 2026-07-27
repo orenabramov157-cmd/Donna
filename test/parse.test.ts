@@ -57,6 +57,21 @@ describe('deterministic grammar', () => {
   it('learn now', () => expect(parseDeterministic('learn now')).toEqual({ op: 'resync' }));
   it('study me', () => expect(parseDeterministic('study me')).toEqual({ op: 'resync' }));
 
+  it('be a <vibe> locks persona verbatim', () =>
+    expect(parseDeterministic('be a hardass with me dont go soft')).toEqual({
+      op: 'persona',
+      directive: 'be a hardass with me dont go soft',
+    }));
+  it('be my drill sergeant', () =>
+    expect(parseDeterministic('be my drill sergeant')).toEqual({ op: 'persona', directive: 'be my drill sergeant' }));
+  it('persona: explicit form', () =>
+    expect(parseDeterministic('persona: no mercy, push me')).toEqual({ op: 'persona', directive: 'no mercy, push me' }));
+  it('persona off clears', () => expect(parseDeterministic('persona off')).toEqual({ op: 'personaclear' }));
+  it('be yourself clears', () => expect(parseDeterministic('be yourself')).toEqual({ op: 'personaclear' }));
+  it('"bet" still confirms, not persona', () => expect(parseDeterministic('bet')).toEqual({ op: 'ok' }));
+  it('"be chill" falls through to the brain', () =>
+    expect(parseDeterministic('be chill')).toMatchObject({ op: 'freetext' }));
+
   it('ok', () => expect(parseDeterministic('ok')).toEqual({ op: 'ok' }));
   it('looks good', () => expect(parseDeterministic('looks good')).toEqual({ op: 'ok' }));
   it('aight (his register)', () => expect(parseDeterministic('aight')).toEqual({ op: 'ok' }));

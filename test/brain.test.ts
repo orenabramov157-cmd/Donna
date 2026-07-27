@@ -117,6 +117,18 @@ describe('validateInterpretation', () => {
     expect(r!.actions).toEqual([{ type: 'status' }]);
   });
 
+  it('accepts set_persona and caps the directive length', () => {
+    const raw = JSON.stringify({
+      actions: [{ type: 'set_persona', directive: 'Be a blunt drill sergeant — push hard, no coddling. ' + 'x'.repeat(300) }],
+      reply: 'bet. no more mr nice donna',
+      question: null,
+      confidence: 0.9,
+    });
+    const r = validateInterpretation(raw, 0, TODAY);
+    expect(r!.actions[0]).toMatchObject({ type: 'set_persona' });
+    expect((r!.actions[0] as { directive: string }).directive.length).toBeLessThanOrEqual(240);
+  });
+
   it('validates snooze minutes with sane clamping', () => {
     const raw = JSON.stringify({
       actions: [{ type: 'snooze', task: 1, minutes: 9999 }],

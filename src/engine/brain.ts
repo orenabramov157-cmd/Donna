@@ -39,7 +39,8 @@ export type BrainAction =
   | { type: 'confirm_plan' }
   | { type: 'undo' }
   | { type: 'help' }
-  | { type: 'set_nag'; level: 'gentle' | 'standard' | 'relentless' };
+  | { type: 'set_nag'; level: 'gentle' | 'standard' | 'relentless' }
+  | { type: 'set_persona'; directive: string };
 
 export interface Interpretation {
   actions: BrainAction[];
@@ -162,6 +163,11 @@ export function validateInterpretation(rawText: string, taskCount: number, today
         }
         break;
       }
+      case 'set_persona': {
+        const directive = str(a.directive);
+        if (directive) actions.push({ type: 'set_persona', directive: directive.slice(0, 240) });
+        break;
+      }
       default:
         break;
     }
@@ -206,6 +212,7 @@ export interface BrainInput {
   transcript: string;
   parts: LocalParts;
   planState: string;
+  persona: string | null;
   styleCard: string | null;
   schedInsights: string | null;
   todayLocal: string;
@@ -239,6 +246,9 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
 
   const system = [
     `You are Donna, a personal accountability agent who texts with her owner. Voice: brief, direct, warm but blunt — never corporate, never listy unless asked. Mirror how the owner texts.`,
+    input.persona
+      ? `OWNER'S STANDING ORDER — they explicitly told you how to treat them. This OUTRANKS everything you've learned; obey it in every reply:\n"${input.persona}"`
+      : '',
     input.styleCard ? `WHO YOU'RE TALKING TO (mirror this — how they talk and how they want you to talk back):\n${input.styleCard}` : '',
     input.schedInsights ? `WHAT YOU KNOW ABOUT THEIR PATTERNS:\n${input.schedInsights}` : '',
     `Timezone: ${input.tz}. ALL times are in this local zone — "5pm" means 17:00 ${input.tz}, never UTC.`,
@@ -252,6 +262,7 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     `{"type":"add_task","title":str,"due_date":"YYYY-MM-DD"|null,"due_time":"HH:MM"|null,"due_in_minutes":int|null,"remind_date":"YYYY-MM-DD"|null,"remind_time":"HH:MM"|null,"remind_in_minutes":int|null} — extract EVERY task mentioned, one action each.`,
     `{"type":"complete","task":n} {"type":"start","task":n} {"type":"notdone","task":n} {"type":"snooze","task":n,"minutes":m} {"type":"defer","task":n} {"type":"drop","task":n,"reason":str|null} {"type":"blocked","task":n,"reason":str} {"type":"set_time","task":n,"time":"HH:MM","date":"YYYY-MM-DD"|null}`,
     `{"type":"status"} {"type":"plan"} {"type":"no_plan"} {"type":"confirm_plan"} {"type":"undo"} {"type":"help"} {"type":"set_nag","level":"gentle|standard|relentless"}`,
+    `{"type":"set_persona","directive":str} — when the owner tells you HOW to behave or talk to them (not a task): "be tougher on me", "stop being soft", "talk to me like a coach", "push me harder", "chill out with the nagging tone". Capture their intent as a concise standing instruction to yourself (e.g. "Be a blunt drill sergeant — push hard, no coddling."). Also obey it immediately in this very "reply".`,
     `TIME RULES (critical — get these exactly right):`,
     `- "remind me in X" / "in X minutes|hours|days" → use remind_in_minutes ONLY (minutes=5, hours×60, days×1440). Example: "in 24 hours"→remind_in_minutes:1440. "in 3 days"→4320. NEVER convert a relative offset into a clock time.`,
     `- A clock time to be nagged ("nag me at 3pm", "remind me at 10am tomorrow") → remind_time (+remind_date if a day is named). "tomorrow 10am"→remind_date=tomorrow's date, remind_time:"10:00".`,
@@ -314,6 +325,7 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
 export interface ReflectionInput {
   transcript: string;
   stats: string;
+  persona: string | null;
   currentStyle: string | null;
   currentInsights: string | null;
 }
@@ -326,6 +338,9 @@ export async function reflect(
   if (!(await aiBudgetOk(env, todayLocal))) return null;
   const system = [
     `You maintain two short memory cards about the owner of an accountability bot named Donna. Rewrite both, merging what was already known with today's new evidence. Be concrete and factual; no psychoanalysis.`,
+    input.persona
+      ? `The owner has issued an explicit STANDING ORDER on how Donna must treat them: "${input.persona}". This is locked and lives outside your cards — do NOT restate, soften, or contradict it in Card 1; Card 1 only adds observations that complement it.`
+      : '',
     `Card 1 STYLE (<=300 chars): (a) how the owner texts — length, slang, punctuation, emoji, capitalization; AND (b) the DYNAMIC they want from Donna, inferred from how they talk to her and what they respond to: do they want a boss / drill-sergeant who pushes hard, or a chill helper? Blunt or gentle? Hype or deadpan? Write it as a directive Donna can follow (e.g. "Texts lowercase, short, casual/profane; wants a blunt hype drill-sergeant, not a soft assistant. Match his energy, don't be corporate.").`,
     `Card 2 INSIGHTS (<=300 chars): schedule/behavior patterns with numbers when possible (when they actually do work, what they defer, response lag).`,
     `Existing STYLE: ${input.currentStyle ?? '(none yet)'}`,

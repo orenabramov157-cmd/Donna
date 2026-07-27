@@ -25,6 +25,8 @@ export type Command =
   | { op: 'settings' }
   | { op: 'resetmemory' }
   | { op: 'resync' }
+  | { op: 'persona'; directive: string }
+  | { op: 'personaclear' }
   | { op: 'naglevel'; level: NagLevel }
   | { op: 'ok' }
   | { op: 'freetext'; text: string };
@@ -69,6 +71,13 @@ export function parseDeterministic(raw: string): Command {
   if (/^settings[?.!]*$/i.test(t)) return { op: 'settings' };
   if (/^reset\s+(?:memory|brain)[.!]*$/i.test(t)) return { op: 'resetmemory' };
   if (/^(?:learn now|re-?learn( me)?|resync|study me|re-?read me)[.!]*$/i.test(t)) return { op: 'resync' };
+  if (/^(?:persona\s+off|be\s+yourself|reset\s+persona)[.!]*$/i.test(t)) return { op: 'personaclear' };
+  if ((m = /^persona[:\s]\s*(.+)$/i.exec(text))) return { op: 'persona', directive: (m[1] ?? '').trim() };
+  // "be a hardass with me" / "be my drill sergeant" — store the owner's whole
+  // sentence verbatim; it already reads as an instruction to Donna. Bare
+  // "be <adjective>" ("be chill") deliberately falls through to the brain,
+  // which catches any phrasing via the set_persona action.
+  if (/^be\s+(?:a|an|my)\s+.+$/i.test(t)) return { op: 'persona', directive: text.trim() };
   if ((m = /^nag\s+(gentle|standard|relentless)$/i.exec(t))) {
     return { op: 'naglevel', level: m[1] as NagLevel };
   }

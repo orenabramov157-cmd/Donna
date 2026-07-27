@@ -547,6 +547,10 @@ async function runBrainAction(c: Ctx, session: SessionRow, action: BrainAction, 
       await updateUserField(c.db, 'nag_level', action.level);
       await sendOwner(c, 'receipt', `Nag level: ${action.level}. 🫡`);
       return;
+    case 'set_persona':
+      await setSetting(c.db, 'persona_directive', action.directive.slice(0, 240));
+      await sendOwner(c, 'receipt', copy.personaReceipt(action.directive.slice(0, 240)));
+      return;
     default:
       return;
   }
@@ -558,12 +562,14 @@ async function brainRoute(c: Ctx, session: SessionRow, text: string): Promise<vo
   const transcript = buildTranscript(await recentInboundTexts(c.db, 10), await recentOutboundBodies(c.db, 10));
   const styleCard = await getSetting(c.db, 'style_card');
   const schedInsights = await getSetting(c.db, 'sched_insights');
+  const persona = await getSetting(c.db, 'persona_directive');
   const result = await interpret(c.env, {
     text,
     tasks: open,
     transcript,
     parts: c.parts,
     planState: session.plan_state,
+    persona: persona || null,
     styleCard: styleCard || null,
     schedInsights: schedInsights || null,
     todayLocal: c.today,
@@ -640,6 +646,7 @@ async function nightlyReflection(c: Ctx): Promise<void> {
   const r = await reflect(c.env, c.today, {
     transcript,
     stats,
+    persona: (await getSetting(c.db, 'persona_directive')) || null,
     currentStyle: (await getSetting(c.db, 'style_card')) || null,
     currentInsights: (await getSetting(c.db, 'sched_insights')) || null,
   });
@@ -816,16 +823,26 @@ async function routeText(c: Ctx, text: string): Promise<void> {
       await setSetting(c.db, 'sched_insights', '');
       await sendOwner(c, 'receipt', copy.MEMORY_RESET);
       return;
+    case 'persona':
+      await setSetting(c.db, 'persona_directive', effective.directive.slice(0, 240));
+      await sendOwner(c, 'receipt', copy.personaReceipt(effective.directive.slice(0, 240)));
+      return;
+    case 'personaclear':
+      await setSetting(c.db, 'persona_directive', '');
+      await sendOwner(c, 'receipt', copy.PERSONA_CLEARED);
+      return;
     case 'resync': {
       const beforeStyle = (await getSetting(c.db, 'style_card')) || '(nothing yet)';
       await setSetting(c.db, 'reflect_date', ''); // bypass the once-a-day guard for an on-demand re-learn
       await nightlyReflection(c);
       const afterStyle = (await getSetting(c.db, 'style_card')) || '(nothing yet)';
       const afterInsights = (await getSetting(c.db, 'sched_insights')) || '(nothing yet)';
+      const order = await getSetting(c.db, 'persona_directive');
+      const orderLine = order ? `\n\n🎭 Your standing order (locked): "${order}"` : '';
       const body =
         beforeStyle === afterStyle
-          ? `🧠 Re-read you just now. My read on your style:\n${afterStyle}\n\nYour patterns:\n${afterInsights}`
-          : `🧠 Just re-studied you. Updated my read:\n\nBEFORE: ${beforeStyle}\n\nNOW: ${afterStyle}`;
+          ? `🧠 Re-read you just now. My read on your style:\n${afterStyle}\n\nYour patterns:\n${afterInsights}${orderLine}`
+          : `🧠 Just re-studied you. Updated my read:\n\nBEFORE: ${beforeStyle}\n\nNOW: ${afterStyle}${orderLine}`;
       await sendOwner(c, 'receipt', body);
       return;
     }

@@ -19,6 +19,7 @@ export const HELP = [
   'Commands (always work):',
   'done / done 2 · start · snooze 30 · tomorrow · not done · blocked <why>',
   'drop 2 <reason> · add: <task> [time] · plan · status · undo · nag gentle|standard|relentless · help',
+  'be a <vibe> (locks how I treat you) · persona off · learn now',
   'Or just talk to me — I usually get it.',
 ].join('\n');
 
@@ -181,6 +182,11 @@ export const SETUP_TEST = `🔧 Test message from your accountability bot — yo
 export const KEYWORDS_FALLBACK = `Didn't catch that. ${'\n'}${HELP}`;
 export const SOFT_ACK = `ugh that one didn't land for me — hit me with it again?`;
 export const MEMORY_RESET = `🧠 Wiped everything I'd learned about you. Fresh start.`;
+
+export function personaReceipt(directive: string): string {
+  return `🎭 Standing order locked: "${directive}"\nThat's how I run things from now on. Say "persona off" to clear it.`;
+}
+export const PERSONA_CLEARED = `🎭 Standing order cleared — back to reading the room myself.`;
 
 export function fmtLocalDay(utcMs: number, tz: string): string {
   return new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'short', month: 'short', day: 'numeric' }).format(
