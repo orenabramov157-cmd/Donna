@@ -54,6 +54,8 @@ describe('deterministic grammar', () => {
   it('help', () => expect(parseDeterministic('help')).toEqual({ op: 'help' }));
   it('?', () => expect(parseDeterministic('?')).toEqual({ op: 'help' }));
   it('nag relentless', () => expect(parseDeterministic('nag relentless')).toEqual({ op: 'naglevel', level: 'relentless' }));
+  it('learn now', () => expect(parseDeterministic('learn now')).toEqual({ op: 'resync' }));
+  it('study me', () => expect(parseDeterministic('study me')).toEqual({ op: 'resync' }));
 
   it('ok', () => expect(parseDeterministic('ok')).toEqual({ op: 'ok' }));
   it('looks good', () => expect(parseDeterministic('looks good')).toEqual({ op: 'ok' }));

@@ -816,6 +816,19 @@ async function routeText(c: Ctx, text: string): Promise<void> {
       await setSetting(c.db, 'sched_insights', '');
       await sendOwner(c, 'receipt', copy.MEMORY_RESET);
       return;
+    case 'resync': {
+      const beforeStyle = (await getSetting(c.db, 'style_card')) || '(nothing yet)';
+      await setSetting(c.db, 'reflect_date', ''); // bypass the once-a-day guard for an on-demand re-learn
+      await nightlyReflection(c);
+      const afterStyle = (await getSetting(c.db, 'style_card')) || '(nothing yet)';
+      const afterInsights = (await getSetting(c.db, 'sched_insights')) || '(nothing yet)';
+      const body =
+        beforeStyle === afterStyle
+          ? `🧠 Re-read you just now. My read on your style:\n${afterStyle}\n\nYour patterns:\n${afterInsights}`
+          : `🧠 Just re-studied you. Updated my read:\n\nBEFORE: ${beforeStyle}\n\nNOW: ${afterStyle}`;
+      await sendOwner(c, 'receipt', body);
+      return;
+    }
     case 'add':
       await addTask(c, effective.title, effective.time, 'daysAhead' in effective ? (effective.daysAhead ?? 0) : 0);
       return;

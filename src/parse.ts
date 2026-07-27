@@ -24,6 +24,7 @@ export type Command =
   | { op: 'help' }
   | { op: 'settings' }
   | { op: 'resetmemory' }
+  | { op: 'resync' }
   | { op: 'naglevel'; level: NagLevel }
   | { op: 'ok' }
   | { op: 'freetext'; text: string };
@@ -67,6 +68,7 @@ export function parseDeterministic(raw: string): Command {
   if (/^(?:help|\?|commands)[?.!]*$/i.test(t)) return { op: 'help' };
   if (/^settings[?.!]*$/i.test(t)) return { op: 'settings' };
   if (/^reset\s+(?:memory|brain)[.!]*$/i.test(t)) return { op: 'resetmemory' };
+  if (/^(?:learn now|re-?learn( me)?|resync|study me|re-?read me)[.!]*$/i.test(t)) return { op: 'resync' };
   if ((m = /^nag\s+(gentle|standard|relentless)$/i.exec(t))) {
     return { op: 'naglevel', level: m[1] as NagLevel };
   }
