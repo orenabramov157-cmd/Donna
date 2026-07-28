@@ -88,6 +88,26 @@ describe('validateInterpretation', () => {
     expect(r!.actions[0]).toMatchObject({ title: 'call sam', due_time: null, remind_time: null });
   });
 
+  it('rejects impossible calendar dates everywhere they are accepted', () => {
+    const raw = JSON.stringify({
+      actions: [
+        {
+          type: 'add_task',
+          title: 'call sam',
+          due_date: '2026-02-30',
+          remind_date: '2026-04-31',
+        },
+        { type: 'set_time', task: 1, time: '10:00', date: '2026-02-29' },
+      ],
+      reply: null,
+      question: null,
+      confidence: 0.8,
+    });
+    const r = validateInterpretation(raw, 1, TODAY);
+    expect(r!.actions[0]).toMatchObject({ due_date: null, remind_date: null });
+    expect(r!.actions[1]).toEqual({ type: 'set_time', task: 1, time: '10:00', date: null });
+  });
+
   it('passes through a pure-chat reply with no actions', () => {
     const raw = JSON.stringify({ actions: [], reply: 'lol you got this', question: null, confidence: 0.9 });
     const r = validateInterpretation(raw, 0, TODAY);

@@ -108,7 +108,10 @@ export function parseTimeToken(raw: string): string | null {
   const ampm = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)$/.exec(t);
   const pad = (n: number): string => String(n).padStart(2, '0');
   if (ampm) {
-    let h = Number(ampm[1]) % 12;
+    const rawHour = Number(ampm[1]);
+    const minute = Number(ampm[2] ?? '00');
+    if (rawHour < 1 || rawHour > 12 || minute >= 60) return null;
+    let h = rawHour % 12;
     if (ampm[3] === 'pm') h += 12;
     return `${pad(h)}:${ampm[2] ?? '00'}`;
   }

@@ -56,11 +56,18 @@ function str(v: unknown): string | null {
   return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
 }
 
-function clampDate(date: string | null, todayLocal: string): string | null {
-  if (!date || !YMD.test(date)) return null;
+function validCalendarDate(date: string): boolean {
+  if (!YMD.test(date)) return false;
+  const y = Number(date.slice(0, 4));
   const m = Number(date.slice(5, 7));
   const d = Number(date.slice(8, 10));
-  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return m >= 1 && m <= 12 && d >= 1 && d <= (daysInMonth[m - 1] ?? 0);
+}
+
+function clampDate(date: string | null, todayLocal: string): string | null {
+  if (!date || !validCalendarDate(date)) return null;
   return date < todayLocal ? todayLocal : date;
 }
 

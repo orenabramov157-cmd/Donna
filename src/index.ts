@@ -7,11 +7,16 @@ import { getSetting } from './db';
 import { getChannel } from './channel';
 import { timingSafeEqualStr } from './channel/types';
 import { handleTrelloWebhook, processInbound, runSetup, tick } from './engine/core';
+import { verifyTrelloWebhook } from './trello';
 
 const VERSION = '1.0.0';
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+function safeRequestPath(path: string): string {
+  return path.replace(/^\/webhook\/(loop|trello)\/[^/]+/, '/webhook/$1/[redacted]');
 }
 
 export default {
@@ -27,9 +32,13 @@ export default {
 
       if (url.pathname === '/setup' && request.method === 'GET') {
         const key = url.searchParams.get('key') ?? '';
-        if (!env.SETUP_KEY || !(await timingSafeEqualStr(env.SETUP_KEY, key))) return new Response('not found', { status: 404 });
+        if (!env.SETUP_KEY || !(await timingSafeEqualStr(env.SETUP_KEY, key))) {
+          return new Response('not found', { status: 404, headers: { 'Cache-Control': 'no-store' } });
+        }
         const html = await runSetup(env, url);
-        return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        return new Response(html, {
+          headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+        });
       }
 
       if (seg[0] === 'webhook' && seg[1] === 'loop' && seg[2]) {
@@ -49,9 +58,17 @@ export default {
         }
         // Trello sends HEAD on webhook registration and expects a 200.
         if (request.method === 'HEAD' || request.method === 'GET') return new Response('ok');
+        const rawBody = await request.text();
+        const signature = request.headers.get('X-Trello-Webhook') ?? '';
+        if (
+          !env.TRELLO_APP_SECRET ||
+          !(await verifyTrelloWebhook(rawBody, request.url, signature, env.TRELLO_APP_SECRET))
+        ) {
+          return new Response('unauthorized', { status: 401 });
+        }
         let body: unknown = null;
         try {
-          body = await request.json();
+          body = JSON.parse(rawBody) as unknown;
         } catch {
           return new Response('ok'); // keep Trello happy; nothing to do
         }
@@ -64,7 +81,7 @@ export default {
       console.error(
         JSON.stringify({
           evt: 'fetch_error',
-          path: url.pathname,
+          path: safeRequestPath(url.pathname),
           err: err instanceof Error ? (err.stack ?? err.message) : String(err),
         }),
       );

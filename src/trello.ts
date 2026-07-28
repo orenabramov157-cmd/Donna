@@ -10,6 +10,38 @@ export function trelloConfigured(env: AppEnv): boolean {
   return Boolean(env.TRELLO_KEY && env.TRELLO_TOKEN && env.TRELLO_BOARD_ID);
 }
 
+function safeApiPath(path: string): string {
+  return path.replace(/^(\/tokens\/)[^/]+/, '$1[redacted]');
+}
+
+export async function verifyTrelloWebhook(
+  rawBody: string,
+  callbackUrl: string,
+  signature: string,
+  secret: string,
+): Promise<boolean> {
+  if (!signature || !secret) return false;
+  let signatureBytes: Uint8Array;
+  try {
+    signatureBytes = Uint8Array.from(atob(signature), (char) => char.charCodeAt(0));
+  } catch {
+    return false;
+  }
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['verify'],
+  );
+  return crypto.subtle.verify(
+    'HMAC',
+    key,
+    signatureBytes,
+    new TextEncoder().encode(rawBody + callbackUrl),
+  );
+}
+
 async function api<T>(
   env: AppEnv,
   method: 'GET' | 'POST' | 'PUT',
@@ -23,8 +55,7 @@ async function api<T>(
   for (const [k, v] of Object.entries(params ?? {})) url.searchParams.set(k, v);
   const res = await fetch(url.toString(), { method });
   if (!res.ok) {
-    const detail = (await res.text()).slice(0, 300);
-    console.error(JSON.stringify({ evt: 'trello_api_error', method, path, status: res.status, detail }));
+    console.error(JSON.stringify({ evt: 'trello_api_error', method, path: safeApiPath(path), status: res.status }));
     return null;
   }
   return (await res.json()) as T;

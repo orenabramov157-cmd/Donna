@@ -69,6 +69,9 @@ describe('parseTimeToken', () => {
   it('12am', () => expect(parseTimeToken('12am')).toBe('00:00'));
   it('16:00', () => expect(parseTimeToken('16:00')).toBe('16:00'));
   it('noon', () => expect(parseTimeToken('noon')).toBe('12:00'));
+  it.each(['13am', '0pm', '4:60pm', '16:60'])('rejects invalid clock time %s', (token) => {
+    expect(parseTimeToken(token)).toBeNull();
+  });
   it('junk', () => expect(parseTimeToken('whenever')).toBeNull());
 });
 

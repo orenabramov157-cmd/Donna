@@ -10,6 +10,7 @@ export interface Secrets {
   TRELLO_KEY?: string;
   TRELLO_TOKEN?: string;
   TRELLO_BOARD_ID?: string;
+  TRELLO_APP_SECRET?: string;
   SETUP_KEY?: string;
   WEBHOOK_TOKEN?: string;
   TWILIO_ACCOUNT_SID?: string;
