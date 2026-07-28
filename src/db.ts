@@ -94,7 +94,17 @@ export async function upsertUser(db: D1Database, u: Omit<UserRow, 'id'>): Promis
     .prepare(
       `INSERT INTO users (id, contact, timezone, morning_time, evening_time, work_start, work_end, quiet_start, quiet_end, nag_level, pulse_every_min)
        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET contact = excluded.contact`,
+       ON CONFLICT(id) DO UPDATE SET
+         contact = excluded.contact,
+         timezone = excluded.timezone,
+         morning_time = excluded.morning_time,
+         evening_time = excluded.evening_time,
+         work_start = excluded.work_start,
+         work_end = excluded.work_end,
+         quiet_start = excluded.quiet_start,
+         quiet_end = excluded.quiet_end,
+         nag_level = excluded.nag_level,
+         pulse_every_min = excluded.pulse_every_min`,
     )
     .bind(
       u.contact,
@@ -278,6 +288,37 @@ export async function markInboundProcessed(db: D1Database, dedupeId: string, err
     .prepare(`UPDATE inbound_events SET processed_at_utc = ?, error = ? WHERE dedupe_id = ?`)
     .bind(Date.now(), error ?? null, dedupeId)
     .run();
+}
+
+export async function recordInboundFailure(
+  db: D1Database,
+  dedupeId: string,
+  error: string,
+  maxAttempts: number,
+): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT error FROM inbound_events WHERE dedupe_id = ?`)
+    .bind(dedupeId)
+    .first<{ error: string | null }>();
+  let previousAttempts = 0;
+  if (row?.error) {
+    try {
+      const previous = JSON.parse(row.error) as { attempts?: unknown };
+      if (typeof previous.attempts === 'number' && Number.isFinite(previous.attempts)) {
+        previousAttempts = Math.max(0, Math.floor(previous.attempts));
+      }
+    } catch {
+      // A legacy plain-text error has no durable attempt count.
+    }
+  }
+  const attemptLimit = Math.max(1, Math.floor(maxAttempts));
+  const attempts = Math.min(previousAttempts + 1, attemptLimit);
+  const terminal = attempts >= attemptLimit;
+  const result = await db
+    .prepare(`UPDATE inbound_events SET processed_at_utc = ?, error = ? WHERE dedupe_id = ?`)
+    .bind(terminal ? Date.now() : null, JSON.stringify({ attempts, error }), dedupeId)
+    .run();
+  return terminal && result.meta.changes > 0;
 }
 
 export async function unprocessedInbound(

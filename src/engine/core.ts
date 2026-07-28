@@ -23,6 +23,7 @@ import {
   recentInboundTexts,
   recentOutboundBodies,
   recentTrelloEcho,
+  recordInboundFailure,
   setOutboundStatus,
   setSetting,
   stuckTasks,
@@ -67,6 +68,7 @@ import { getChannel, type Inbound, type SendOpts } from '../channel';
 
 const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'chat', 'misc'];
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
+const MAX_INBOUND_ATTEMPTS = 5;
 
 interface Ctx {
   env: AppEnv;
@@ -945,8 +947,12 @@ export async function processInbound(env: AppEnv, inbound: Inbound): Promise<voi
     const note = await handleInboundCore(env, inbound, Date.now());
     await markInboundProcessed(env.DB, inbound.dedupeId, note);
   } catch (err) {
-    // Leave unprocessed only on crash-before-this-line; here we record the error.
-    await markInboundProcessed(env.DB, inbound.dedupeId, err instanceof Error ? err.message : String(err));
+    await recordInboundFailure(
+      env.DB,
+      inbound.dedupeId,
+      err instanceof Error ? err.message : String(err),
+      MAX_INBOUND_ATTEMPTS,
+    );
     throw err;
   }
 }
@@ -1154,7 +1160,12 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
       const note = await handleInboundCore(env, JSON.parse(row.raw) as Inbound, c.now);
       await markInboundProcessed(c.db, row.dedupe_id, note);
     } catch (err) {
-      await markInboundProcessed(c.db, row.dedupe_id, `sweep: ${err instanceof Error ? err.message : String(err)}`);
+      await recordInboundFailure(
+        c.db,
+        row.dedupe_id,
+        `sweep: ${err instanceof Error ? err.message : String(err)}`,
+        MAX_INBOUND_ATTEMPTS,
+      );
     }
   }
 
@@ -1187,7 +1198,7 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
   steps.push({ name: 'Database schema', ok: true, note: 'migrations applied' });
 
   let user = await getUser(env.DB);
-  if (!user && env.OWNER_CONTACT) {
+  if (env.OWNER_CONTACT) {
     await upsertUser(env.DB, {
       contact: env.OWNER_CONTACT,
       timezone: env.TIMEZONE || 'America/Los_Angeles',
