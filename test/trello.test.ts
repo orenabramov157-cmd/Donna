@@ -71,6 +71,22 @@ describe('Trello API errors', () => {
     expect(entries.join('\n')).not.toContain('key-secret');
     expect(entries.join('\n')).not.toContain('token-secret');
   });
+
+  it('does not create a webhook when listing existing webhooks fails', async () => {
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response('upstream failed', { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ id: 'unexpected' }), { status: 200 }));
+    const env = {
+      TRELLO_KEY: 'key-secret',
+      TRELLO_TOKEN: 'token-secret',
+      TRELLO_BOARD_ID: 'board-id',
+    } as AppEnv;
+
+    await expect(trello.registerWebhook(env, CALLBACK_URL)).resolves.toBe('failed');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('Trello HTTP surface', () => {

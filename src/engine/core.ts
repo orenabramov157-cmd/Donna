@@ -98,7 +98,13 @@ async function sendOwner(
   trelloCardId?: string | null,
 ): Promise<void> {
   const channel = getChannel(c.env);
-  const res = await channel.send(c.env, c.user.contact, body, taskId ? { passthrough: `task:${taskId}` } : undefined);
+  const origin = await getSetting(c.db, 'public_origin');
+  const statusCallbackUrl = origin && c.env.WEBHOOK_TOKEN ? `${origin}/webhook/loop/${c.env.WEBHOOK_TOKEN}` : undefined;
+  const opts =
+    taskId || statusCallbackUrl
+      ? { ...(taskId ? { passthrough: `task:${taskId}` } : {}), ...(statusCallbackUrl ? { statusCallbackUrl } : {}) }
+      : undefined;
+  const res = await channel.send(c.env, c.user.contact, body, opts);
   await logOutbound(c.db, {
     kind,
     task_id: taskId ?? null,
@@ -1172,6 +1178,7 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
   const sendTest = requestUrl.searchParams.get('test') === '1';
 
   await ensureSchema(env.DB);
+  await setSetting(env.DB, 'public_origin', origin);
   steps.push({ name: 'Database schema', ok: true, note: 'migrations applied' });
 
   let user = await getUser(env.DB);

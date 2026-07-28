@@ -4,7 +4,7 @@
 // X-Twilio-Signature (HMAC-SHA1 over URL + sorted params).
 
 import type { AppEnv } from '../env';
-import type { Channel, Inbound } from './types';
+import type { Channel, Inbound, SendOpts } from './types';
 import { timingSafeEqualStr } from './types';
 
 async function twilioSignature(authToken: string, url: string, params: Record<string, string>): Promise<string> {
@@ -23,12 +23,13 @@ async function twilioSignature(authToken: string, url: string, params: Record<st
 export const twilio: Channel = {
   name: 'twilio',
 
-  async send(env: AppEnv, to: string, text: string) {
+  async send(env: AppEnv, to: string, text: string, opts?: SendOpts) {
     if (!env.TWILIO_ACCOUNT_SID || !env.TWILIO_AUTH_TOKEN || !env.TWILIO_FROM) {
       console.error(JSON.stringify({ evt: 'twilio_send_skipped', reason: 'TWILIO_* secrets missing' }));
       return null;
     }
     const body = new URLSearchParams({ To: to, From: env.TWILIO_FROM, Body: text });
+    if (opts?.statusCallbackUrl) body.set('StatusCallback', opts.statusCallbackUrl);
     const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${env.TWILIO_ACCOUNT_SID}/Messages.json`, {
       method: 'POST',
       headers: {

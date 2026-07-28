@@ -117,7 +117,8 @@ export async function registerWebhook(env: AppEnv, callbackURL: string): Promise
     'GET',
     `/tokens/${env.TRELLO_TOKEN}/webhooks`,
   );
-  if (existing?.some((w) => w.callbackURL === callbackURL && w.idModel === env.TRELLO_BOARD_ID)) return 'exists';
+  if (!existing) return 'failed';
+  if (existing.some((w) => w.callbackURL === callbackURL && w.idModel === env.TRELLO_BOARD_ID)) return 'exists';
   const created = await api<{ id: string }>(env, 'POST', '/webhooks/', {
     callbackURL,
     idModel: env.TRELLO_BOARD_ID,

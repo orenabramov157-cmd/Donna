@@ -19,6 +19,7 @@ export type Inbound =
 export interface SendOpts {
   passthrough?: string;
   replyToId?: string;
+  statusCallbackUrl?: string;
 }
 
 export interface Channel {
