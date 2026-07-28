@@ -58,7 +58,7 @@ describe('outbound retry delivery', () => {
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
     vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
     vi.spyOn(db, 'getSetting').mockResolvedValue('https://donna.example');
-    const update = vi.spyOn(db, 'setOutboundStatus').mockResolvedValue();
+    const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
 
     await tick(
       { DB: {} as D1Database, WEBHOOK_TOKEN: 'public-token', CHANNEL: 'twilio' } as AppEnv,
@@ -74,7 +74,14 @@ describe('outbound retry delivery', () => {
         statusCallbackUrl: 'https://donna.example/webhook/loop/public-token',
       },
     );
-    expect(update).toHaveBeenCalledWith({} as D1Database, outbound.id, 'sent', 3, 'SM-new');
+    expect(complete).toHaveBeenCalledWith(
+      {} as D1Database,
+      outbound.id,
+      expect.any(String),
+      'sent',
+      3,
+      'SM-new',
+    );
   });
 
   it('keeps the prior provider message ID when a retry cannot send', async () => {
@@ -108,13 +115,20 @@ describe('outbound retry delivery', () => {
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
     vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
     vi.spyOn(db, 'getSetting').mockResolvedValue('https://donna.example');
-    const update = vi.spyOn(db, 'setOutboundStatus').mockResolvedValue();
+    const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
 
     await tick(
       { DB: {} as D1Database, WEBHOOK_TOKEN: 'public-token', CHANNEL: 'twilio' } as AppEnv,
       Date.UTC(2026, 6, 28, 14, 0),
     );
 
-    expect(update).toHaveBeenCalledWith({} as D1Database, outbound.id, 'failed', 3, undefined);
+    expect(complete).toHaveBeenCalledWith(
+      {} as D1Database,
+      outbound.id,
+      expect.any(String),
+      'failed',
+      3,
+      undefined,
+    );
   });
 });

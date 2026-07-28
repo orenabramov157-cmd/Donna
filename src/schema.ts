@@ -81,6 +81,14 @@ const MIGRATIONS: string[][] = [
     `CREATE INDEX IF NOT EXISTS idx_outbound_msg ON outbound_log (channel_message_id)`,
     `CREATE INDEX IF NOT EXISTS idx_outbound_status ON outbound_log (status, at_utc)`,
   ],
+  [
+    `ALTER TABLE daily_sessions ADD COLUMN outbound_claim_token TEXT`,
+    `ALTER TABLE tasks ADD COLUMN outbound_claim_token TEXT`,
+    `ALTER TABLE outbound_log ADD COLUMN attempt_token TEXT`,
+    `ALTER TABLE outbound_log ADD COLUMN lease_until_utc INTEGER`,
+    `ALTER TABLE outbound_log ADD COLUMN dedupe_key TEXT`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_outbound_dedupe ON outbound_log (dedupe_key)`,
+  ],
 ];
 
 let schemaReady: Promise<void> | null = null; // process-wide init latch, not request state

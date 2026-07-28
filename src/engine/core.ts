@@ -7,9 +7,11 @@ import {
   appendEvent,
   claimInbound,
   claimOutboundRetry,
+  claimSessionOutbound,
   claimSessionFields,
   claimSettingLease,
-  claimTaskNag,
+  claimTaskNagOutbound,
+  completeOutboundAttempt,
   createTask,
   dueTasks,
   ensureSession,
@@ -30,7 +32,7 @@ import {
   recentTrelloEcho,
   recordInboundFailure,
   renewInboundClaim,
-  setOutboundStatus,
+  setOutboundStatusByMessageId,
   setSetting,
   stuckTasks,
   taskByCard,
@@ -184,32 +186,45 @@ async function sendOwner(
   taskId?: number | null,
   trelloCardId?: string | null,
 ): Promise<void> {
-  const channel = getChannel(c.env);
-  const opts = await deliverySendOpts(c.env, c.db, taskId);
-  let messageId: string | null = null;
-  let sent = false;
+  const claimToken = crypto.randomUUID();
+  const id = await logOutbound(c.db, {
+    kind,
+    task_id: taskId ?? null,
+    trello_card_id: trelloCardId ?? null,
+    body,
+    status: 'retrying',
+    attempt_token: claimToken,
+    lease_until_utc: Date.now() + SCHEDULER_LEASE_MS,
+  });
+  await dispatchOutboundAttempt(c, id, claimToken, body, taskId ?? null, 0);
+}
+
+async function dispatchOutboundAttempt(
+  c: Ctx,
+  id: number,
+  claimToken: string,
+  body: string,
+  taskId: number | null,
+  retryCount: number,
+): Promise<void> {
   try {
-    const res = await channel.send(c.env, c.user.contact, body, opts);
-    if (res) {
-      sent = true;
-      messageId = res.messageId;
-    }
+    const res = await getChannel(c.env).send(
+      c.env,
+      c.user.contact,
+      body,
+      await deliverySendOpts(c.env, c.db, taskId),
+    );
+    await completeOutboundAttempt(c.db, id, claimToken, res ? 'sent' : 'failed', retryCount, res?.messageId);
   } catch (err) {
     console.error(
       JSON.stringify({
         evt: 'owner_send_failed',
+        outboundId: id,
         err: err instanceof Error ? err.message : String(err),
       }),
     );
+    await completeOutboundAttempt(c.db, id, claimToken, 'failed', retryCount);
   }
-  await logOutbound(c.db, {
-    kind,
-    task_id: taskId ?? null,
-    channel_message_id: messageId,
-    trello_card_id: trelloCardId ?? null,
-    body,
-    status: sent ? 'sent' : 'failed',
-  });
 }
 
 // -- undo -------------------------------------------------------------------
@@ -785,7 +800,7 @@ async function syncTrelloToday(c: Ctx): Promise<void> {
   }
 }
 
-async function morningPrompt(c: Ctx, session: SessionRow): Promise<void> {
+async function prepareMorningPrompt(c: Ctx): Promise<string> {
   const stuck = await stuckTasks(c.db);
   if (stuck.length > 0 && (await getSetting(c.db, 'stuck_review_date')) !== c.today) {
     await setSetting(c.db, 'stuck_review_date', c.today);
@@ -807,8 +822,17 @@ async function morningPrompt(c: Ctx, session: SessionRow): Promise<void> {
   await setSetting(c.db, 'plan_proposal', JSON.stringify(proposal));
   await saveStatusOrder(c, open);
   const map = new Map<number, string>(Object.entries(proposal).map(([k, v]) => [Number(k), v]));
-  await sendOwner(c, 'plan', copy.planPrompt(open, map, c.tz));
-  await updateSession(c.db, c.today, { plan_state: 'prompted', prompted_at_utc: c.now });
+  return copy.planPrompt(open, map, c.tz);
+}
+
+async function morningPrompt(c: Ctx, session: SessionRow): Promise<void> {
+  await sendOwner(c, 'plan', await prepareMorningPrompt(c));
+  await claimSessionFields(
+    c.db,
+    c.today,
+    { plan_state: session.plan_state, prompted_at_utc: session.prompted_at_utc },
+    { plan_state: 'prompted', prompted_at_utc: c.now },
+  );
 }
 
 async function confirmPlan(c: Ctx): Promise<void> {
@@ -1013,8 +1037,11 @@ async function handleInboundCore(env: AppEnv, inbound: Inbound, now: number): Pr
 
   if (inbound.kind === 'status') {
     if (inbound.refMessageId) {
-      const out = await outboundByMessageId(c.db, inbound.refMessageId);
-      if (out) await setOutboundStatus(c.db, out.id, inbound.status === 'failed' ? 'failed' : 'delivered');
+      await setOutboundStatusByMessageId(
+        c.db,
+        inbound.refMessageId,
+        inbound.status === 'failed' ? 'failed' : 'delivered',
+      );
     }
     return undefined;
   }
@@ -1155,11 +1182,6 @@ async function buildRecap(c: Ctx): Promise<copy.RecapStats> {
 
 async function weeklyIfDue(c: Ctx, session: SessionRow): Promise<void> {
   if (c.parts.weekday !== 'Sun' || session.weekly_sent) return;
-  if (
-    !(await claimSessionFields(c.db, c.today, { weekly_sent: 0 }, { weekly_sent: 1 }))
-  ) {
-    return;
-  }
   const events = await eventsInRange(c.db, c.now - 7 * 86_400_000, c.now + 1);
   const completed = events.filter((e) => e.kind === 'completed').length;
   const dropped = events.filter((e) => e.kind === 'dropped').length;
@@ -1174,7 +1196,20 @@ async function weeklyIfDue(c: Ctx, session: SessionRow): Promise<void> {
       worst = (await getTask(c.db, taskId))?.title ?? null;
     }
   }
-  await sendOwner(c, 'recap', copy.weeklyRecap(completed, dropped, deferred.length, worst));
+  const body = copy.weeklyRecap(completed, dropped, deferred.length, worst);
+  const token = crypto.randomUUID();
+  const claimed = await claimSessionOutbound(
+    c.db,
+    c.today,
+    { weekly_sent: 0 },
+    { weekly_sent: 1 },
+    { kind: 'recap', body },
+    token,
+    c.now,
+    SCHEDULER_LEASE_MS,
+    `session:${c.today}:weekly`,
+  );
+  if (claimed) await dispatchOutboundAttempt(c, claimed.id, token, body, null, 0);
 }
 
 export async function tick(env: AppEnv, nowMs: number): Promise<void> {
@@ -1191,42 +1226,54 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   if (!quiet && session.plan_state === 'unplanned' && c.parts.minOfDay >= morningMin) {
     if (c.parts.minOfDay >= eveningMin) {
       await updateSession(c.db, c.today, { plan_state: 'no_plan' }); // day already over; stay quiet
-    } else if (
-      await claimSessionFields(
+    } else {
+      const body = await prepareMorningPrompt(c);
+      const token = crypto.randomUUID();
+      const claimed = await claimSessionOutbound(
         c.db,
         c.today,
         { plan_state: 'unplanned' },
         { plan_state: 'prompted', prompted_at_utc: c.now },
-      )
-    ) {
-      await morningPrompt(c, session);
+        { kind: 'plan', body },
+        token,
+        c.now,
+        SCHEDULER_LEASE_MS,
+        `session:${c.today}:morning`,
+      );
+      if (claimed) await dispatchOutboundAttempt(c, claimed.id, token, body, null, 0);
     }
   } else if (session.plan_state === 'prompted' && session.prompted_at_utc) {
     const elapsed = c.now - session.prompted_at_utc;
     if (elapsed > 4 * 3_600_000 && session.nudges_sent >= 2) {
       await updateSession(c.db, c.today, { plan_state: 'no_plan' });
     } else if (elapsed > 3 * 3_600_000 && session.nudges_sent === 1 && !quiet) {
-      if (
-        await claimSessionFields(
-          c.db,
-          c.today,
-          { plan_state: 'prompted', nudges_sent: 1 },
-          { nudges_sent: 2 },
-        )
-      ) {
-        await sendOwner(c, 'plan', copy.PLAN_NUDGE_FINAL);
-      }
+      const token = crypto.randomUUID();
+      const claimed = await claimSessionOutbound(
+        c.db,
+        c.today,
+        { plan_state: 'prompted', prompted_at_utc: session.prompted_at_utc, nudges_sent: 1 },
+        { nudges_sent: 2 },
+        { kind: 'plan', body: copy.PLAN_NUDGE_FINAL },
+        token,
+        c.now,
+        SCHEDULER_LEASE_MS,
+        `session:${c.today}:nudge:2`,
+      );
+      if (claimed) await dispatchOutboundAttempt(c, claimed.id, token, copy.PLAN_NUDGE_FINAL, null, 0);
     } else if (elapsed > 45 * 60_000 && session.nudges_sent === 0 && !quiet) {
-      if (
-        await claimSessionFields(
-          c.db,
-          c.today,
-          { plan_state: 'prompted', nudges_sent: 0 },
-          { nudges_sent: 1 },
-        )
-      ) {
-        await sendOwner(c, 'plan', copy.PLAN_NUDGE_1);
-      }
+      const token = crypto.randomUUID();
+      const claimed = await claimSessionOutbound(
+        c.db,
+        c.today,
+        { plan_state: 'prompted', prompted_at_utc: session.prompted_at_utc, nudges_sent: 0 },
+        { nudges_sent: 1 },
+        { kind: 'plan', body: copy.PLAN_NUDGE_1 },
+        token,
+        c.now,
+        SCHEDULER_LEASE_MS,
+        `session:${c.today}:nudge:1`,
+      );
+      if (claimed) await dispatchOutboundAttempt(c, claimed.id, token, copy.PLAN_NUDGE_1, null, 0);
     }
   }
 
@@ -1245,27 +1292,30 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
       }
       const body = t.status === 'started' ? copy.startedCheckin(t) : copy.nagMsg(t, sentToday === 0);
       const nextStatus = t.status === 'started' ? 'started' : 'nagging';
-      if (
-        !(await claimTaskNag(
-          c.db,
-          t.id,
-          {
-            status: t.status,
-            next_action_at_utc: t.next_action_at_utc,
-            nags_sent_today: t.nags_sent_today,
-            last_nag_at_utc: t.last_nag_at_utc,
-          },
-          {
-            status: nextStatus,
-            nags_sent_today: sentToday + 1,
-            last_nag_at_utc: c.now,
-            next_action_at_utc: c.now + policy.intervalMin * 60_000,
-          },
-        ))
-      ) {
-        continue;
-      }
-      await sendOwner(c, t.status === 'started' ? 'checkin' : 'nag', body, t.id);
+      const token = crypto.randomUUID();
+      const claimed = await claimTaskNagOutbound(
+        c.db,
+        t.id,
+        {
+          status: t.status,
+          next_action_at_utc: t.next_action_at_utc,
+          nags_sent_today: t.nags_sent_today,
+          last_nag_at_utc: t.last_nag_at_utc,
+        },
+        {
+          status: nextStatus,
+          nags_sent_today: sentToday + 1,
+          last_nag_at_utc: c.now,
+          next_action_at_utc: c.now + policy.intervalMin * 60_000,
+        },
+        { kind: t.status === 'started' ? 'checkin' : 'nag', task_id: t.id, body },
+        token,
+        c.now,
+        SCHEDULER_LEASE_MS,
+        `task:${t.id}:nag:${t.next_action_at_utc}`,
+      );
+      if (!claimed) continue;
+      await dispatchOutboundAttempt(c, claimed.id, token, body, t.id, 0);
       await appendEvent(c.db, t.id, 'reminded');
       await setSetting(c.db, 'last_nagged_task', String(t.id));
     }
@@ -1288,21 +1338,35 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   }
 
   // Evening recap
+  let eveningRecapClaimed = false;
   if (c.parts.minOfDay >= eveningMin && !session.recap_sent_at_utc && session.plan_state !== 'unplanned') {
-    if (
-      await claimSessionFields(
+    const body = copy.eveningRecap(await buildRecap(c));
+    const token = crypto.randomUUID();
+    const claimed = await claimSessionOutbound(
         c.db,
         c.today,
         { plan_state: session.plan_state, recap_sent_at_utc: null },
         { recap_sent_at_utc: c.now },
-      )
-    ) {
-      await sendOwner(c, 'recap', copy.eveningRecap(await buildRecap(c)));
-      await weeklyIfDue(c, session);
+        { kind: 'recap', body },
+        token,
+        c.now,
+        SCHEDULER_LEASE_MS,
+        `session:${c.today}:recap`,
+      );
+    if (claimed) {
+      await dispatchOutboundAttempt(c, claimed.id, token, body, null, 0);
+      eveningRecapClaimed = true;
       await nightlyReflection(c);
     }
   } else if (!quiet) {
     await maybeEarlySeed(c);
+  }
+  if (
+    c.parts.minOfDay >= eveningMin &&
+    session.plan_state !== 'unplanned' &&
+    (session.recap_sent_at_utc !== null || eveningRecapClaimed)
+  ) {
+    await weeklyIfDue(c, session);
   }
 
   // Durable-inbox sweep: rows the worker crashed on before marking processed
@@ -1331,32 +1395,10 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   }
 
   // Outbound retries
-  for (const row of await failedOutbound(c.db)) {
-    if (!(await claimOutboundRetry(c.db, row.id, row.retry_count))) continue;
-    try {
-      const res = await getChannel(env).send(
-        env,
-        c.user.contact,
-        row.body,
-        await deliverySendOpts(env, c.db, row.task_id),
-      );
-      await setOutboundStatus(
-        c.db,
-        row.id,
-        res ? 'sent' : 'failed',
-        row.retry_count + 1,
-        res ? res.messageId : undefined,
-      );
-    } catch (err) {
-      console.error(
-        JSON.stringify({
-          evt: 'outbound_retry_failed',
-          outboundId: row.id,
-          err: err instanceof Error ? err.message : String(err),
-        }),
-      );
-      await setOutboundStatus(c.db, row.id, 'failed', row.retry_count + 1, undefined);
-    }
+  for (const row of await failedOutbound(c.db, c.now)) {
+    const token = crypto.randomUUID();
+    if (!(await claimOutboundRetry(c.db, row.id, row.retry_count, token, c.now, SCHEDULER_LEASE_MS))) continue;
+    await dispatchOutboundAttempt(c, row.id, token, row.body, row.task_id, row.retry_count + 1);
   }
 }
 

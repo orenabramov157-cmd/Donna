@@ -6,14 +6,19 @@ import * as db from '../src/db';
 import {
   claimOutboundRetry,
   claimInbound,
+  claimSessionOutbound,
   claimSessionFields,
   claimSettingLease,
   claimTaskNag,
+  claimTaskNagOutbound,
+  completeOutboundAttempt,
+  failedOutbound,
   incrementSettingBelow,
   markInboundProcessed,
   recordInboundFailure,
   renewInboundClaim,
   setOutboundStatus,
+  setOutboundStatusByMessageId,
   upsertUser,
 } from '../src/db';
 import { aiBudgetOk } from '../src/parse';
@@ -329,6 +334,204 @@ function conditionalClaimsDb() {
   return { db: { prepare } as unknown as D1Database, prepare, state };
 }
 
+function recoverableOutboundDb() {
+  const state = {
+    id: 8,
+    status: 'retrying',
+    retryCount: 2,
+    taskId: 42,
+    messageId: 'SM-old' as string | null,
+    attemptToken: 'worker-old' as string | null,
+    leaseUntil: 1_100,
+  };
+  const prepare = vi.fn((sql: string) => ({
+    bind: vi.fn((...args: unknown[]) => ({
+      first: async () => {
+        if (sql.includes("SET status = 'retrying'")) {
+          const [token, leaseUntil, id, retryCount, nowUtc] = args as [string, number, number, number, number];
+          if (
+            state.id !== id ||
+            state.retryCount !== retryCount ||
+            !(
+              (state.status === 'failed' && state.attemptToken === null) ||
+              (state.status === 'retrying' && state.leaseUntil <= nowUtc)
+            )
+          ) {
+            return null;
+          }
+          state.status = 'retrying';
+          state.attemptToken = token;
+          state.leaseUntil = leaseUntil;
+          return { id, attempt_token: token };
+        }
+        if (sql.includes('attempt_token = NULL')) {
+          const [status, retryCount, messageId, id, token] = args as [string, number, string | null, number, string];
+          if (state.id !== id || state.status !== 'retrying' || state.attemptToken !== token) return null;
+          state.status = status;
+          state.retryCount = retryCount;
+          if (messageId !== null) state.messageId = messageId;
+          state.attemptToken = null;
+          state.leaseUntil = 0;
+          return { id };
+        }
+        if (sql.includes('WHERE channel_message_id = ?')) {
+          const [status, messageId] = args as [string, string];
+          if (state.messageId !== messageId || state.attemptToken !== null) return null;
+          state.status = status;
+          return { id: state.id };
+        }
+        throw new Error(`unexpected first SQL: ${sql}`);
+      },
+      all: async () => {
+        const [nowUtc] = args as [number];
+        const retryable =
+          state.retryCount < 5 &&
+          (state.status === 'failed' || (state.status === 'retrying' && state.leaseUntil <= nowUtc));
+        return {
+          results: retryable
+            ? [{
+                id: state.id,
+                at_utc: 0,
+                kind: 'nag',
+                task_id: state.taskId,
+                channel_message_id: state.messageId,
+                trello_card_id: null,
+                body: 'Finish the draft.',
+                status: state.status,
+                retry_count: state.retryCount,
+                attempt_token: state.attemptToken,
+                lease_until_utc: state.leaseUntil,
+              }]
+            : [],
+        };
+      },
+    })),
+  }));
+  return { db: { prepare } as unknown as D1Database, prepare, state };
+}
+
+function atomicLogicalOutboundDb(updateChanges: number) {
+  const prepared: Array<{ sql: string; args: unknown[] }> = [];
+  const prepare = vi.fn((sql: string) => ({
+    bind: vi.fn((...args: unknown[]) => {
+      const statement = { sql, args };
+      prepared.push(statement);
+      return statement;
+    }),
+  }));
+  const batch = vi.fn(async () => [
+    { meta: { changes: updateChanges } },
+    { meta: { changes: updateChanges, last_row_id: updateChanges ? 81 : 0 } },
+  ]);
+  return {
+    db: { prepare, batch } as unknown as D1Database,
+    prepared,
+    batch,
+  };
+}
+
+describe('recoverable outbound generations', () => {
+  it('leaves a leased session outbound row recoverable after hard termination before dispatch', async () => {
+    const fake = atomicLogicalOutboundDb(1);
+
+    const claim = await claimSessionOutbound(
+      fake.db,
+      '2026-07-28',
+      { plan_state: 'unplanned' },
+      { plan_state: 'prompted', prompted_at_utc: 2_000 },
+      { kind: 'plan', body: 'Plan body.' },
+      'session-worker',
+      2_000,
+      300_000,
+      'session:2026-07-28:morning',
+    );
+
+    expect(claim).toEqual({ id: 81, token: 'session-worker' });
+    expect(fake.batch).toHaveBeenCalledOnce();
+    expect(fake.prepared[0]?.sql).toContain('UPDATE daily_sessions');
+    expect(fake.prepared[1]?.sql).toContain('INSERT OR IGNORE INTO outbound_log');
+    expect(fake.prepared[1]?.args).toEqual(
+      expect.arrayContaining(['session-worker', 302_000, 'session:2026-07-28:morning']),
+    );
+  });
+
+  it('leaves a leased task-nag outbound row recoverable after hard termination before dispatch', async () => {
+    const fake = atomicLogicalOutboundDb(1);
+
+    const claim = await claimTaskNagOutbound(
+      fake.db,
+      42,
+      { status: 'pending', next_action_at_utc: 1_000, nags_sent_today: 0, last_nag_at_utc: null },
+      { status: 'nagging', next_action_at_utc: 62_000, nags_sent_today: 1, last_nag_at_utc: 2_000 },
+      { kind: 'nag', task_id: 42, body: 'Finish it.' },
+      'task-worker',
+      2_000,
+      300_000,
+      'task:42:nag:1000',
+    );
+
+    expect(claim).toEqual({ id: 81, token: 'task-worker' });
+    expect(fake.batch).toHaveBeenCalledOnce();
+    expect(fake.prepared[0]?.sql).toContain('UPDATE tasks');
+    expect(fake.prepared[1]?.sql).toContain('INSERT OR IGNORE INTO outbound_log');
+  });
+
+  it('reclaims an expired retry generation with exactly one new winner', async () => {
+    const fake = recoverableOutboundDb();
+
+    expect(await failedOutbound(fake.db, 1_099)).toEqual([]);
+    expect(await failedOutbound(fake.db, 1_100)).toHaveLength(1);
+    const winners = await Promise.all([
+      claimOutboundRetry(fake.db, 8, 2, 'worker-A', 1_100, 300),
+      claimOutboundRetry(fake.db, 8, 2, 'worker-B', 1_100, 300),
+    ]);
+
+    expect(winners.filter(Boolean)).toHaveLength(1);
+    expect(fake.state).toMatchObject({
+      status: 'retrying',
+      attemptToken: 'worker-A',
+      leaseUntil: 1_400,
+    });
+  });
+
+  it('ignores an old-ID callback and stale completion while a newer retry generation owns the row', async () => {
+    const fake = recoverableOutboundDb();
+    expect(await claimOutboundRetry(fake.db, 8, 2, 'worker-new', 1_100, 300)).toBe(true);
+
+    expect(await setOutboundStatusByMessageId(fake.db, 'SM-old', 'failed')).toBe(false);
+    expect(await completeOutboundAttempt(fake.db, 8, 'worker-old', 'sent', 3, 'SM-stale')).toBe(false);
+    expect(fake.state).toMatchObject({ status: 'retrying', attemptToken: 'worker-new', messageId: 'SM-old' });
+
+    expect(await completeOutboundAttempt(fake.db, 8, 'worker-new', 'sent', 3, 'SM-new')).toBe(true);
+    expect(fake.state).toMatchObject({
+      status: 'sent',
+      retryCount: 3,
+      attemptToken: null,
+      messageId: 'SM-new',
+    });
+  });
+
+  it('rejects a stale nudge snapshot after prompted_at_utc is refreshed', async () => {
+    const fake = atomicLogicalOutboundDb(0);
+
+    await expect(
+      claimSessionOutbound(
+        fake.db,
+        '2026-07-28',
+        { plan_state: 'prompted', prompted_at_utc: 1_000, nudges_sent: 0 },
+        { nudges_sent: 1 },
+        { kind: 'plan', body: 'Nudge.' },
+        'nudge-worker',
+        4_000,
+        300_000,
+        'session:2026-07-28:nudge:1',
+      ),
+    ).resolves.toBeNull();
+
+    expect(fake.prepared[0]?.args).toContain(1_000);
+  });
+});
+
 describe('scheduler and outbound claims', () => {
   it('allows only one overlapping claimant for each scheduler and retry state', async () => {
     const fake = conditionalClaimsDb();
@@ -365,15 +568,9 @@ describe('scheduler and outbound claims', () => {
       claimSettingLease(fake.db, 'scheduler:pulse', 2_000, 300_000),
       claimSettingLease(fake.db, 'scheduler:pulse', 2_000, 300_000),
     ]);
-    const retryClaims = await Promise.all([
-      claimOutboundRetry(fake.db, 8, 2),
-      claimOutboundRetry(fake.db, 8, 2),
-    ]);
-
     expect(sessionClaims.filter(Boolean)).toHaveLength(1);
     expect(nagClaims.filter(Boolean)).toHaveLength(1);
     expect(leaseClaims.filter(Boolean)).toHaveLength(1);
-    expect(retryClaims.filter(Boolean)).toHaveLength(1);
   });
 
   it('stores successful retry status, count, and replacement message ID without losing task correlation', async () => {
@@ -409,7 +606,7 @@ describe('scheduler and outbound claims', () => {
     vi.spyOn(db, 'getSetting').mockResolvedValue(null);
     vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
     vi.spyOn(db, 'ensureSession').mockResolvedValue(session);
-    const claim = vi.spyOn(db, 'claimSessionFields').mockResolvedValue(true);
+    const claim = vi.spyOn(db, 'claimSessionOutbound').mockResolvedValue({ id: 81, token: 'session-worker' });
     vi.spyOn(db, 'stuckTasks').mockResolvedValue([]);
     vi.spyOn(db, 'openTasks').mockResolvedValue([]);
     vi.spyOn(db, 'dueTasks').mockResolvedValue([]);
@@ -419,7 +616,7 @@ describe('scheduler and outbound claims', () => {
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([]);
     vi.spyOn(db, 'updateSession').mockResolvedValue();
-    const logged = vi.spyOn(db, 'logOutbound').mockResolvedValue(81);
+    const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
     const send = vi.fn().mockRejectedValue(new Error('provider timeout'));
     vi.spyOn(channel, 'getChannel').mockReturnValue({
       name: 'test',
@@ -434,15 +631,19 @@ describe('scheduler and outbound claims', () => {
       '2026-07-28',
       { plan_state: 'unplanned' },
       { plan_state: 'prompted', prompted_at_utc: now },
+      expect.objectContaining({ kind: 'plan', body: expect.any(String) }),
+      expect.any(String),
+      now,
+      5 * 60_000,
+      'session:2026-07-28:morning',
     );
     expect(claim.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0] ?? 0);
-    expect(logged).toHaveBeenCalledWith(
+    expect(complete).toHaveBeenCalledWith(
       database,
-      expect.objectContaining({
-        kind: 'plan',
-        status: 'failed',
-        channel_message_id: null,
-      }),
+      81,
+      expect.any(String),
+      'failed',
+      0,
     );
   });
 });

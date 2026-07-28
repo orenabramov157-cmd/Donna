@@ -31,6 +31,7 @@ export interface TaskRow {
   pending_prompt: string | null;
   created_by: string;
   created_at_utc: number;
+  outbound_claim_token?: string | null;
 }
 
 export interface SessionRow {
@@ -40,6 +41,7 @@ export interface SessionRow {
   nudges_sent: number;
   recap_sent_at_utc: number | null;
   weekly_sent: number;
+  outbound_claim_token?: string | null;
 }
 
 export interface OutboundRow {
@@ -52,6 +54,9 @@ export interface OutboundRow {
   body: string;
   status: string;
   retry_count: number;
+  attempt_token?: string | null;
+  lease_until_utc?: number | null;
+  dedupe_key?: string | null;
 }
 
 export interface EventRow {
@@ -616,13 +621,17 @@ export interface NewOutbound {
   trello_card_id?: string | null;
   body: string;
   status?: string;
+  attempt_token?: string | null;
+  lease_until_utc?: number | null;
+  dedupe_key?: string | null;
 }
 
 export async function logOutbound(db: D1Database, o: NewOutbound): Promise<number> {
   const res = await db
     .prepare(
-      `INSERT INTO outbound_log (at_utc, kind, task_id, channel_message_id, trello_card_id, body, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO outbound_log
+       (at_utc, kind, task_id, channel_message_id, trello_card_id, body, status, attempt_token, lease_until_utc, dedupe_key)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       Date.now(),
@@ -632,9 +641,144 @@ export async function logOutbound(db: D1Database, o: NewOutbound): Promise<numbe
       o.trello_card_id ?? null,
       o.body,
       o.status ?? 'sent',
+      o.attempt_token ?? null,
+      o.lease_until_utc ?? null,
+      o.dedupe_key ?? null,
     )
     .run();
   return Number(res.meta.last_row_id);
+}
+
+function prepareLeasedOutbound(
+  db: D1Database,
+  o: NewOutbound,
+  claimToken: string,
+  nowUtc: number,
+  leaseMs: number,
+  dedupeKey: string,
+  guardSql: string,
+  guardArgs: unknown[],
+): D1PreparedStatement {
+  const duration = Number.isFinite(leaseMs) ? Math.max(1, Math.floor(leaseMs)) : 1;
+  return db
+    .prepare(
+      `INSERT OR IGNORE INTO outbound_log
+       (at_utc, kind, task_id, channel_message_id, trello_card_id, body, status,
+        retry_count, attempt_token, lease_until_utc, dedupe_key)
+       SELECT ?, ?, ?, ?, ?, ?, 'retrying', 0, ?, ?, ?
+       WHERE EXISTS (${guardSql})`,
+    )
+    .bind(
+      nowUtc,
+      o.kind,
+      o.task_id ?? null,
+      o.channel_message_id ?? null,
+      o.trello_card_id ?? null,
+      o.body,
+      claimToken,
+      nowUtc + duration,
+      dedupeKey,
+      ...guardArgs,
+    );
+}
+
+export async function claimSessionOutbound(
+  db: D1Database,
+  localDate: string,
+  expected: Partial<SessionRow>,
+  fields: Partial<SessionRow>,
+  outbound: NewOutbound,
+  claimToken: string,
+  nowUtc: number,
+  leaseMs: number,
+  dedupeKey: string,
+): Promise<{ id: number; token: string } | null> {
+  const expectedKeys = Object.keys(expected).filter((key): key is keyof SessionRow =>
+    SESSION_FIELDS.has(key as keyof SessionRow),
+  );
+  const fieldKeys = Object.keys(fields).filter((key): key is keyof SessionRow =>
+    SESSION_FIELDS.has(key as keyof SessionRow),
+  );
+  if (expectedKeys.length === 0 || fieldKeys.length === 0) return null;
+  const update = db
+    .prepare(
+      `UPDATE daily_sessions
+       SET ${fieldKeys.map((key) => `${key} = ?`).join(', ')}, outbound_claim_token = ?
+       WHERE local_date = ? AND ${expectedKeys.map((key) => `${key} IS ?`).join(' AND ')}`,
+    )
+    .bind(
+      ...fieldKeys.map((key) => fields[key] ?? null),
+      claimToken,
+      localDate,
+      ...expectedKeys.map((key) => expected[key] ?? null),
+    );
+  const results = await db.batch([
+    update,
+    prepareLeasedOutbound(
+      db,
+      outbound,
+      claimToken,
+      nowUtc,
+      leaseMs,
+      dedupeKey,
+      `SELECT 1 FROM daily_sessions WHERE local_date = ? AND outbound_claim_token = ?`,
+      [localDate, claimToken],
+    ),
+  ]);
+  const stateClaimed = Number(results[0]?.meta.changes ?? 0) > 0;
+  const outboundInserted = Number(results[1]?.meta.changes ?? 0) > 0;
+  if (!stateClaimed || !outboundInserted) return null;
+  return { id: Number(results[1]?.meta.last_row_id), token: claimToken };
+}
+
+export async function claimTaskNagOutbound(
+  db: D1Database,
+  id: number,
+  expected: TaskNagState,
+  fields: TaskNagState,
+  outbound: NewOutbound,
+  claimToken: string,
+  nowUtc: number,
+  leaseMs: number,
+  dedupeKey: string,
+): Promise<{ id: number; token: string } | null> {
+  const update = db
+    .prepare(
+      `UPDATE tasks
+       SET status = ?, nags_sent_today = ?, last_nag_at_utc = ?, next_action_at_utc = ?,
+           outbound_claim_token = ?
+       WHERE id = ? AND status IS ? AND nags_sent_today IS ?
+       AND last_nag_at_utc IS ? AND next_action_at_utc IS ?`,
+    )
+    .bind(
+      fields.status,
+      fields.nags_sent_today,
+      fields.last_nag_at_utc,
+      fields.next_action_at_utc,
+      claimToken,
+      id,
+      expected.status,
+      expected.nags_sent_today,
+      expected.last_nag_at_utc,
+      expected.next_action_at_utc,
+    );
+  const results = await db.batch([
+    update,
+    prepareLeasedOutbound(
+      db,
+      outbound,
+      claimToken,
+      nowUtc,
+      leaseMs,
+      dedupeKey,
+      `SELECT 1 FROM tasks WHERE id = ? AND outbound_claim_token = ?`,
+      [id, claimToken],
+    ),
+  ]);
+  const taskClaimed = Number(results[0]?.meta.changes ?? 0) > 0;
+  const outboundInserted = Number(results[1]?.meta.changes ?? 0) > 0;
+  if (!taskClaimed || !outboundInserted) return null;
+  return { id: Number(results[1]?.meta.last_row_id), token: claimToken };
 }
 
 export async function outboundByMessageId(db: D1Database, messageId: string): Promise<OutboundRow | null> {
@@ -673,22 +817,79 @@ export async function setOutboundStatus(
     .run();
 }
 
-export async function claimOutboundRetry(db: D1Database, id: number, retryCount: number): Promise<boolean> {
-  const claimed = await db
+export async function completeOutboundAttempt(
+  db: D1Database,
+  id: number,
+  claimToken: string,
+  status: string,
+  retryCount: number,
+  channelMessageId?: string | null,
+): Promise<boolean> {
+  const completed = await db
     .prepare(
-      `UPDATE outbound_log SET status = 'retrying'
-       WHERE id = ? AND status = 'failed' AND retry_count = ? AND retry_count < 5
+      `UPDATE outbound_log
+       SET status = ?, retry_count = ?, channel_message_id = COALESCE(?, channel_message_id),
+           attempt_token = NULL, lease_until_utc = NULL
+       WHERE id = ? AND status = 'retrying' AND attempt_token = ?
        RETURNING id`,
     )
-    .bind(id, retryCount)
+    .bind(status, retryCount, channelMessageId ?? null, id, claimToken)
     .first<{ id: number }>();
-  return claimed !== null;
+  return completed !== null;
 }
 
-export async function failedOutbound(db: D1Database, limit = 5): Promise<OutboundRow[]> {
+export async function setOutboundStatusByMessageId(
+  db: D1Database,
+  messageId: string,
+  status: string,
+): Promise<boolean> {
+  const updated = await db
+    .prepare(
+      `UPDATE outbound_log SET status = ?
+       WHERE channel_message_id = ? AND attempt_token IS NULL AND status != 'retrying'
+       RETURNING id`,
+    )
+    .bind(status, messageId)
+    .first<{ id: number }>();
+  return updated !== null;
+}
+
+export async function claimOutboundRetry(
+  db: D1Database,
+  id: number,
+  retryCount: number,
+  claimToken: string,
+  nowUtc: number,
+  leaseMs: number,
+): Promise<boolean> {
+  const duration = Number.isFinite(leaseMs) ? Math.max(1, Math.floor(leaseMs)) : 1;
+  const claimed = await db
+    .prepare(
+      `UPDATE outbound_log
+       SET status = 'retrying', attempt_token = ?, lease_until_utc = ?
+       WHERE id = ? AND retry_count = ? AND retry_count < 5
+       AND (
+         (status = 'failed' AND attempt_token IS NULL)
+         OR (status = 'retrying' AND COALESCE(lease_until_utc, 0) <= ?)
+       )
+       RETURNING id, attempt_token`,
+    )
+    .bind(claimToken, nowUtc + duration, id, retryCount, nowUtc)
+    .first<{ id: number; attempt_token: string }>();
+  return claimed !== null && claimed.attempt_token === claimToken;
+}
+
+export async function failedOutbound(db: D1Database, nowUtc: number, limit = 5): Promise<OutboundRow[]> {
   const res = await db
-    .prepare(`SELECT * FROM outbound_log WHERE status = 'failed' AND retry_count < 5 ORDER BY at_utc ASC LIMIT ?`)
-    .bind(limit)
+    .prepare(
+      `SELECT * FROM outbound_log
+       WHERE retry_count < 5 AND (
+         (status = 'failed' AND attempt_token IS NULL)
+         OR (status = 'retrying' AND COALESCE(lease_until_utc, 0) <= ?)
+       )
+       ORDER BY at_utc ASC LIMIT ?`,
+    )
+    .bind(nowUtc, limit)
     .all<OutboundRow>();
   return res.results;
 }
