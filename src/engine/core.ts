@@ -63,7 +63,7 @@ import {
   registerWebhook,
   trelloConfigured,
 } from '../trello';
-import { getChannel, type Inbound } from '../channel';
+import { getChannel, type Inbound, type SendOpts } from '../channel';
 
 const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'chat', 'misc'];
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
@@ -76,6 +76,16 @@ interface Ctx {
   now: number;
   parts: LocalParts;
   today: string;
+}
+
+async function deliverySendOpts(env: AppEnv, db: D1Database, taskId?: number | null): Promise<SendOpts | undefined> {
+  const origin = await getSetting(db, 'public_origin');
+  const statusCallbackUrl = origin && env.WEBHOOK_TOKEN ? `${origin}/webhook/loop/${env.WEBHOOK_TOKEN}` : undefined;
+  if (!taskId && !statusCallbackUrl) return undefined;
+  return {
+    ...(taskId ? { passthrough: `task:${taskId}` } : {}),
+    ...(statusCallbackUrl ? { statusCallbackUrl } : {}),
+  };
 }
 
 async function buildCtx(env: AppEnv, now: number): Promise<Ctx | null> {
@@ -98,12 +108,7 @@ async function sendOwner(
   trelloCardId?: string | null,
 ): Promise<void> {
   const channel = getChannel(c.env);
-  const origin = await getSetting(c.db, 'public_origin');
-  const statusCallbackUrl = origin && c.env.WEBHOOK_TOKEN ? `${origin}/webhook/loop/${c.env.WEBHOOK_TOKEN}` : undefined;
-  const opts =
-    taskId || statusCallbackUrl
-      ? { ...(taskId ? { passthrough: `task:${taskId}` } : {}), ...(statusCallbackUrl ? { statusCallbackUrl } : {}) }
-      : undefined;
+  const opts = await deliverySendOpts(c.env, c.db, taskId);
   const res = await channel.send(c.env, c.user.contact, body, opts);
   await logOutbound(c.db, {
     kind,
@@ -1155,8 +1160,8 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
 
   // Outbound retries
   for (const row of await failedOutbound(c.db)) {
-    const res = await getChannel(env).send(env, c.user.contact, row.body);
-    await setOutboundStatus(c.db, row.id, res ? 'sent' : 'failed', row.retry_count + 1);
+    const res = await getChannel(env).send(env, c.user.contact, row.body, await deliverySendOpts(env, c.db, row.task_id));
+    await setOutboundStatus(c.db, row.id, res ? 'sent' : 'failed', row.retry_count + 1, res ? res.messageId : undefined);
   }
 }
 

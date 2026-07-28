@@ -340,12 +340,25 @@ export async function recentTrelloEcho(db: D1Database, cardId: string, sinceUtc:
   return row !== null;
 }
 
-export async function setOutboundStatus(db: D1Database, id: number, status: string, retryCount?: number): Promise<void> {
-  if (retryCount === undefined) {
+export async function setOutboundStatus(
+  db: D1Database,
+  id: number,
+  status: string,
+  retryCount?: number,
+  channelMessageId?: string | null,
+): Promise<void> {
+  if (retryCount === undefined && channelMessageId === undefined) {
     await db.prepare(`UPDATE outbound_log SET status = ? WHERE id = ?`).bind(status, id).run();
-  } else {
-    await db.prepare(`UPDATE outbound_log SET status = ?, retry_count = ? WHERE id = ?`).bind(status, retryCount, id).run();
+    return;
   }
+  if (channelMessageId === undefined) {
+    await db.prepare(`UPDATE outbound_log SET status = ?, retry_count = ? WHERE id = ?`).bind(status, retryCount, id).run();
+    return;
+  }
+  await db
+    .prepare(`UPDATE outbound_log SET status = ?, retry_count = ?, channel_message_id = ? WHERE id = ?`)
+    .bind(status, retryCount, channelMessageId, id)
+    .run();
 }
 
 export async function failedOutbound(db: D1Database, limit = 5): Promise<OutboundRow[]> {
