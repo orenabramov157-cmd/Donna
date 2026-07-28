@@ -115,6 +115,14 @@ async function applyMigrations(db: D1Database): Promise<void> {
     const marker = db
       .prepare(`INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc) VALUES (?, ?)`)
       .bind(version, Date.now());
-    await db.batch([...statements.map((s) => db.prepare(s)), marker]);
+    try {
+      await db.batch([...statements.map((s) => db.prepare(s)), marker]);
+    } catch (err) {
+      const concurrentlyApplied = await db
+        .prepare(`SELECT version FROM schema_migrations WHERE version = ?`)
+        .bind(version)
+        .first<{ version: number }>();
+      if (concurrentlyApplied?.version !== version) throw err;
+    }
   }
 }

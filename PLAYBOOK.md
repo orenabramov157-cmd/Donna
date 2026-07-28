@@ -21,7 +21,7 @@ Known risk: the LoopMessage sandbox is a test tier. If it is ever capped or clos
 ## 2. Architecture decisions
 
 - **One Worker, one D1 database, one cron (`* * * * *`).** No Queues, despite them now being free. Rationale: LoopMessage allows 15 seconds to answer a webhook (vs Slack's 3), so inbound work is done inline. Durability comes from writing every inbound event to D1 **before** processing; a cron sweep retries anything unprocessed. Fewer moving parts for a hand-off appliance.
-- **Self-migrating schema.** The Worker applies its own SQL migrations (versioned, idempotent) at startup and on `/setup`. No `wrangler d1 migrations` CLI step — this keeps the Deploy-to-Cloudflare button flow browser-only and avoids the known gap where D1 subcommands don't resolve auto-provisioned bindings.
+- **Self-migrating schema.** The Worker applies its own SQL migrations (versioned, idempotent) at startup and on `/setup`. Each version's statements and marker commit in one D1 batch. If two cold isolates race, a failed replay is accepted only after a fresh exact-version marker read proves the other isolate committed that version. No `wrangler d1 migrations` CLI step — this keeps the Deploy-to-Cloudflare button flow browser-only and avoids the known gap where D1 subcommands don't resolve auto-provisioned bindings.
 - **Auto-provisioned resources.** `wrangler.jsonc` declares the D1 binding without an ID; the Deploy button / wrangler provisions it on first deploy.
 - **Pluggable channel.** `src/channel/types.ts` defines the interface; `loopmessage.ts` (default) and `twilio.ts` implement it. `CHANNEL` var selects.
 - **Trello owns the task list; D1 owns the accountability layer.** Reminder state, nag counts, deferral ladder, and the append-only event history live in D1, keyed to Trello card IDs. Tasks created by text are mirrored into Trello. If Trello is not configured, the bot still works with its own list.
@@ -32,25 +32,25 @@ Known risk: the LoopMessage sandbox is a test tier. If it is ever capped or clos
 - Send: `POST https://a.loopmessage.com/api/v1/message/send/`, headers `Authorization: <org api key>` (no Bearer prefix), body `{ contact, text, passthrough?, reply_to_id?, effect? }`. Sandbox ignores `sender`.
 - Inbound webhook JSON: `event` (`message_inbound`, `message_reaction`, `message_delivered`, `message_failed`), `contact`, `text`, `message_type`, `message_id`, `webhook_id`.
 - Webhook auth: LoopMessage sends the `Authorization` header value configured in their dashboard; the Worker compares it timing-safely to secret `LOOP_WEBHOOK_AUTH`. Requests must be answered `200` within 15s; retries up to 30×, deduped via `webhook_id` in `inbound_events`.
-- `passthrough` on outbound carries `task_id`, so delivery/failure webhooks and **tapback reactions** map back to tasks. A 👍 or ❤️ reaction on a nag = `done` for that task. 👎 = `not done yet` (opens recommitment).
+- `passthrough` on outbound carries versioned JSON with the outbound row ID, attempt token, and optional task ID. Delivery/failure callbacks therefore correlate to one exact send generation; a callback racing provider completion stays in the durable inbox and retries after completion, while an old generation cannot mutate a newer attempt. **Tapback reactions** resolve by provider message ID. A 👍 or ❤️ reaction on a nag = `done` for that task. 👎 = `not done yet` (opens recommitment).
 - Only messages from `OWNER_CONTACT` are processed; everything else is logged and ignored.
 
 ## 4. Trello sync
 
-- `/setup` resolves the board (`TRELLO_BOARD_ID` secret) and finds lists by name (`TRELLO_TODAY_LIST`, `TRELLO_DONE_LIST`, defaults "Today"/"Done"), storing their IDs in `settings`. It registers one webhook on the board (callback contains a random path token).
+- `/setup` resolves the board (`TRELLO_BOARD_ID` secret) and finds lists by name (`TRELLO_TODAY_LIST`, `TRELLO_DONE_LIST`, defaults "Today"/"Done"), storing their IDs in `settings`. It requires `TRELLO_APP_SECRET` before registering or reporting ready the signed board webhook (whose callback also contains a random path token).
 - Board → bot: `createCard` into Today = new task (bot asks for a time at the next touchpoint). `updateCard` moved into Done = task completed (`source: trello`, no nag). Card renamed = title updated. Card moved out of Today = task dropped with reason `moved in trello`.
 - Bot → board: task done by text/tapback = card moved to Done + `dueComplete`. Task added by text (`add: call vendor 10am`) = card created in Today with due date. Drops archive the card only if it was bot-created.
-- Loop prevention: every board mutation the bot makes is recorded in `outbound_log`; matching webhook actions arriving within 10 minutes are ignored.
+- Loop prevention: every board mutation the bot makes is recorded in `outbound_log`; exact matching webhook actions arriving within 10 minutes are ignored. A move echo matches only when the webhook destination is the configured Done list.
 
 ## 5. Data model (D1)
 
 - `settings(key TEXT PK, value TEXT)` — schema version, resolved Trello IDs, AI daily counter, setup state.
-- `users(id=1)` — contact, timezone, `morning_time`, `evening_time`, `work_start`, `work_end`, `quiet_start`, `quiet_end`, `nag_level`, `pulse_every_min`. Seeded from vars at `/setup`; editable by texting settings commands.
+- `users(id=1)` — contact, timezone, `morning_time`, `evening_time`, `work_start`, `work_end`, `quiet_start`, `quiet_end`, `nag_level`, `pulse_every_min`. Seeded atomically from fully validated vars at `/setup`; an invalid IANA timezone, non-`HH:MM` time, unsupported nag level, or pulse interval below 15 leaves the previous row unchanged. Editable by texting settings commands.
 - `tasks(id, trello_card_id UNIQUE NULL, title, definition_of_done NULL, source_local_date, due_at_utc NULL, next_action_at_utc NULL, status, consecutive_deferrals, nags_sent_today, last_nag_at_utc NULL, blocker NULL, created_by)` — status ∈ `pending | nagging | awaiting_reply | awaiting_recommitment | started | done | dropped | stuck | deferred`.
 - `task_events(id, task_id, at_utc, kind, detail)` — append-only: created/reminded/started/completed/deferred/recommitted/rewritten/blocked/dropped/stuck/undone/trello_synced.
 - `daily_sessions(local_date PK, plan_state, recap_sent_at, nudges_sent, stats)` — plan_state ∈ `unplanned | prompted | planning | confirmed | no_plan`.
 - `inbound_events(dedupe_id PK, received_at_utc, raw, processed_at_utc NULL, error NULL)` — idempotency + durable inbox.
-- `outbound_log(id, at_utc, kind, task_id NULL, channel_message_id NULL, body)` — nag accounting, reaction resolution, Trello echo suppression.
+- `outbound_log(id, at_utc, kind, task_id NULL, channel_message_id NULL, body, status, retry_count, attempt_token, lease_until_utc)` — nag accounting, reaction resolution, Trello echo suppression, and leased send generations. `attempt_token` retains the last completed generation until the next retry claims the row.
 
 ## 6. A day in the life (engine behavior)
 
@@ -73,7 +73,7 @@ Bare replies resolve to the task most recently nagged about; `<n>` indexes the n
 ## 8. HTTP surface
 
 - `POST /webhook/loop/:token` — LoopMessage inbound (token + `Authorization` both verified, timing-safe).
-- `HEAD|POST /webhook/trello/:token` — Trello callback (HEAD 200s for registration).
+- `HEAD|POST /webhook/trello/:token` — Trello callback (HEAD 200s for registration; POST requires Trello's HMAC-SHA1 signature using `TRELLO_APP_SECRET`).
 - `GET /setup?key=<SETUP_KEY>` — idempotent HTML setup page: migrations, secret presence, Trello auth + list resolution, webhook registration, test iMessage. Re-run anytime.
 - `GET /health` — `{ ok, version, last_cron_at }`, no secrets.
 - Anything else: 404. Errors: structured JSON logs (`console.error`), no `passThroughOnException`.
@@ -82,14 +82,14 @@ Bare replies resolve to the task most recently nagged about; `<n>` indexes the n
 
 Vars (in `wrangler.jsonc`, editable in dashboard): `TIMEZONE`, `MORNING_TIME`, `EVENING_TIME`, `WORK_START`, `WORK_END`, `QUIET_START`, `QUIET_END`, `NAG_LEVEL`, `PULSE_EVERY_MIN`, `CHANNEL`, `AI_MODEL`, `AI_DAILY_CAP`, `TRELLO_TODAY_LIST`, `TRELLO_DONE_LIST`.
 
-Secrets (dashboard → Settings → Variables and Secrets; never in the repo): `LOOP_AUTH_KEY`, `LOOP_WEBHOOK_AUTH`, `OWNER_CONTACT`, `TRELLO_KEY`, `TRELLO_TOKEN`, `TRELLO_BOARD_ID`, `SETUP_KEY`, `WEBHOOK_TOKEN`. Twilio path adds `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`.
+Secrets (dashboard → Settings → Variables and Secrets; never in the repo): `LOOP_AUTH_KEY`, `LOOP_WEBHOOK_AUTH`, `OWNER_CONTACT`, `TRELLO_KEY`, `TRELLO_TOKEN`, `TRELLO_BOARD_ID`, `TRELLO_APP_SECRET`, `SETUP_KEY`, `WEBHOOK_TOKEN`. Twilio path adds `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM`.
 
 ## 10. Degradation modes
 
 | Failure | Behavior |
 |---|---|
 | Workers AI quota/model failure | Deterministic grammar + "reply with keywords" prompt; never blocks core flow |
-| LoopMessage send failure | Logged in `outbound_log`, retried by cron (max 5, backoff); `message_failed` webhook recorded |
+| LoopMessage send failure | Logged in `outbound_log`, retried by cron (max 5); a racing `message_failed` callback is durably retried until its exact attempt generation completes |
 | Trello down / not configured | Bot runs standalone on D1 tasks; sync resumes on next webhook/cron |
 | Webhook redelivery | Deduped by `webhook_id` / Trello action id in `inbound_events` |
 | Cron gap (platform) | Next tick catches up from timestamps; `/health` exposes `last_cron_at` |

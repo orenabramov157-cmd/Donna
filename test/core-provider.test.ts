@@ -68,15 +68,21 @@ describe('outbound retry delivery', () => {
       Date.UTC(2026, 6, 28, 14, 0),
     );
 
-    expect(send).toHaveBeenCalledWith(
-      expect.anything(),
-      user.contact,
-      outbound.body,
-      {
-        passthrough: 'task:42',
-        statusCallbackUrl: 'https://donna.example/webhook/loop/public-token',
-      },
+    expect(send).toHaveBeenCalledWith(expect.anything(), user.contact, outbound.body, expect.any(Object));
+    const sendOptions = send.mock.calls[0]?.[3] as
+      | { passthrough?: string; statusCallbackUrl?: string }
+      | undefined;
+    expect(sendOptions?.passthrough).toContain('"outboundId":8');
+    expect(sendOptions?.passthrough).toContain('"attemptToken":');
+    expect(sendOptions?.passthrough).toContain('"taskId":42');
+    const callbackUrl = new URL(sendOptions?.statusCallbackUrl ?? 'https://invalid.example');
+    expect(callbackUrl.origin + callbackUrl.pathname).toBe(
+      'https://donna.example/webhook/loop/public-token',
     );
+    expect(callbackUrl.searchParams.get('outbound_id')).toBe('8');
+    const callbackToken = callbackUrl.searchParams.get('attempt_token');
+    expect(callbackToken).toBeTruthy();
+    expect(sendOptions?.passthrough).toContain(`"attemptToken":"${callbackToken}"`);
     expect(complete).toHaveBeenCalledWith(
       {} as D1Database,
       outbound.id,

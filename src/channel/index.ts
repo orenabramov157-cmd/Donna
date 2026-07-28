@@ -7,4 +7,5 @@ export function getChannel(env: AppEnv): Channel {
   return env.CHANNEL === 'twilio' ? twilio : loopMessage;
 }
 
+export { encodeDeliveryAttemptMetadata } from './types';
 export type { Channel, Inbound, SendOpts } from './types';

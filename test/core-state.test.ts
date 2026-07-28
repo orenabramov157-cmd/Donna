@@ -3,6 +3,7 @@ import type { AppEnv } from '../src/env';
 import type { UserRow } from '../src/db';
 import * as channel from '../src/channel';
 import * as db from '../src/db';
+import * as trello from '../src/trello';
 import {
   claimOutboundRetry,
   claimInbound,
@@ -16,6 +17,7 @@ import {
   incrementSettingBelow,
   markInboundProcessed,
   recordInboundFailure,
+  recentTrelloEcho,
   renewInboundClaim,
   setOutboundStatus,
   setOutboundStatusByMessageId,
@@ -334,7 +336,9 @@ function conditionalClaimsDb() {
   return { db: { prepare } as unknown as D1Database, prepare, state };
 }
 
-function recoverableOutboundDb() {
+function recoverableOutboundDb(
+  options: { completeBeforeGenerationRead?: boolean; completeBeforeMessageRead?: boolean } = {},
+) {
   const state = {
     id: 8,
     status: 'retrying',
@@ -353,7 +357,8 @@ function recoverableOutboundDb() {
             state.id !== id ||
             state.retryCount !== retryCount ||
             !(
-              (state.status === 'failed' && state.attemptToken === null) ||
+              (state.status === 'failed' &&
+                (!sql.includes('attempt_token IS NULL') || state.attemptToken === null)) ||
               (state.status === 'retrying' && state.leaseUntil <= nowUtc)
             )
           ) {
@@ -364,19 +369,46 @@ function recoverableOutboundDb() {
           state.leaseUntil = leaseUntil;
           return { id, attempt_token: token };
         }
-        if (sql.includes('attempt_token = NULL')) {
+        if (sql.includes('lease_until_utc = NULL')) {
           const [status, retryCount, messageId, id, token] = args as [string, number, string | null, number, string];
           if (state.id !== id || state.status !== 'retrying' || state.attemptToken !== token) return null;
           state.status = status;
           state.retryCount = retryCount;
           if (messageId !== null) state.messageId = messageId;
-          state.attemptToken = null;
+          if (sql.includes('attempt_token = NULL')) state.attemptToken = null;
           state.leaseUntil = 0;
           return { id };
         }
+        if (sql.includes('WHERE id = ?') && sql.includes('attempt_token = ?')) {
+          const [status, id, token] = args as [string, number, string];
+          if (state.id !== id || state.status === 'retrying' || state.attemptToken !== token) return null;
+          state.status = status;
+          return { id };
+        }
+        if (sql.startsWith('SELECT') && sql.includes('WHERE id = ?')) {
+          const [id] = args as [number];
+          if (options.completeBeforeGenerationRead && id === state.id && state.status === 'retrying') {
+            state.status = 'sent';
+            state.leaseUntil = 0;
+          }
+          return id === state.id
+            ? { id: state.id, status: state.status, attempt_token: state.attemptToken }
+            : null;
+        }
+        if (sql.startsWith('SELECT') && sql.includes('channel_message_id = ?')) {
+          const [messageId] = args as [string];
+          if (options.completeBeforeMessageRead && state.status === 'retrying') {
+            state.status = 'sent';
+            state.messageId = messageId;
+            state.leaseUntil = 0;
+          }
+          return messageId === state.messageId
+            ? { id: state.id, status: state.status, attempt_token: state.attemptToken }
+            : null;
+        }
         if (sql.includes('WHERE channel_message_id = ?')) {
           const [status, messageId] = args as [string, string];
-          if (state.messageId !== messageId || state.attemptToken !== null) return null;
+          if (state.messageId !== messageId || state.status === 'retrying') return null;
           state.status = status;
           return { id: state.id };
         }
@@ -386,7 +418,11 @@ function recoverableOutboundDb() {
         const [nowUtc] = args as [number];
         const retryable =
           state.retryCount < 5 &&
-          (state.status === 'failed' || (state.status === 'retrying' && state.leaseUntil <= nowUtc));
+          (
+            (state.status === 'failed' &&
+              (!sql.includes('attempt_token IS NULL') || state.attemptToken === null)) ||
+            (state.status === 'retrying' && state.leaseUntil <= nowUtc)
+          );
         return {
           results: retryable
             ? [{
@@ -430,7 +466,66 @@ function atomicLogicalOutboundDb(updateChanges: number) {
   };
 }
 
+function trelloEchoDb(
+  rows: Array<{ cardId: string; atUtc: number; kind: string; body: string }>,
+) {
+  const prepare = vi.fn((sql: string) => ({
+    bind: vi.fn(
+      (cardId: string, sinceUtc: number, expectedKind: string, detail: string | null, repeatedDetail: string | null) => ({
+        first: async () => {
+          expect(sql).toContain('trello_card_id = ?');
+          expect(sql).toContain('at_utc >= ?');
+          expect(sql).toContain('kind = ?');
+          expect(sql).toContain('(? IS NULL OR body = ?)');
+          expect(repeatedDetail).toBe(detail);
+          const match = rows.find(
+            (row) =>
+              row.cardId === cardId &&
+              row.atUtc >= sinceUtc &&
+              row.kind === expectedKind &&
+              (detail === null || row.body === detail),
+          );
+          return match ? { id: 1 } : null;
+        },
+      }),
+    ),
+  }));
+  return { db: { prepare } as unknown as D1Database, prepare };
+}
+
 describe('Trello webhook echo correlation', () => {
+  it('matches exact create, move-to-Done, and archive echoes in the real SQL helper', async () => {
+    const fake = trelloEchoDb([
+      { cardId: 'card-create', atUtc: 9_500, kind: 'trello_create', body: 'Write report' },
+      { cardId: 'card-move', atUtc: 9_600, kind: 'trello_move', body: 'done' },
+      { cardId: 'card-archive', atUtc: 9_700, kind: 'trello_archive', body: 'drop' },
+    ]);
+
+    await expect(
+      recentTrelloEcho(fake.db, 'card-create', 9_000, 'trello_create', 'Write report'),
+    ).resolves.toBe(true);
+    await expect(
+      recentTrelloEcho(fake.db, 'card-move', 9_000, 'trello_move', 'done'),
+    ).resolves.toBe(true);
+    await expect(
+      recentTrelloEcho(fake.db, 'card-archive', 9_000, 'trello_archive', 'drop'),
+    ).resolves.toBe(true);
+  });
+
+  it('does not cross-match action kinds or move destinations in the real SQL helper', async () => {
+    const fake = trelloEchoDb([
+      { cardId: 'card-1', atUtc: 9_500, kind: 'trello_create', body: 'done' },
+      { cardId: 'card-2', atUtc: 9_500, kind: 'trello_move', body: 'done' },
+    ]);
+
+    await expect(
+      recentTrelloEcho(fake.db, 'card-1', 9_000, 'trello_move', 'done'),
+    ).resolves.toBe(false);
+    await expect(
+      recentTrelloEcho(fake.db, 'card-2', 9_000, 'trello_move', 'backlog'),
+    ).resolves.toBe(false);
+  });
+
   it('suppresses a create echo without suppressing a subsequent move to Done', async () => {
     const env = { DB: {} as D1Database } as AppEnv;
     vi.spyOn(db, 'recentTrelloEcho').mockImplementation(async (_db, _cardId, _sinceUtc, kind) => kind === 'trello_create');
@@ -482,6 +577,55 @@ describe('Trello webhook echo correlation', () => {
       'trello_move',
       'done',
     );
+  });
+
+  it('does not classify a move to a non-Done destination as a Done echo', async () => {
+    const env = { DB: {} as D1Database } as AppEnv;
+    const echo = vi.spyOn(db, 'recentTrelloEcho').mockResolvedValue(true);
+    vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
+    vi.spyOn(db, 'getSetting').mockImplementation(async (_db, key) => {
+      if (key === 'trello_today_list_id') return 'today';
+      if (key === 'trello_done_list_id') return 'done';
+      return null;
+    });
+    vi.spyOn(db, 'ensureSession').mockResolvedValue({
+      local_date: '2026-07-28',
+      plan_state: 'unplanned',
+      prompted_at_utc: null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null,
+      weekly_sent: 0,
+    });
+    const existing = {
+      id: 42,
+      trello_card_id: 'card-1',
+      title: 'Write report',
+      definition_of_done: null,
+      source_local_date: '2026-07-28',
+      due_at_utc: null,
+      next_action_at_utc: null,
+      status: 'pending',
+      consecutive_deferrals: 0,
+      nags_sent_today: 0,
+      last_nag_at_utc: null,
+      blocker: null,
+      pending_prompt: null,
+      created_by: 'owner',
+      created_at_utc: 1,
+    };
+    vi.spyOn(db, 'taskByCard').mockResolvedValue(existing);
+    const update = vi.spyOn(db, 'updateTask').mockResolvedValue();
+    vi.spyOn(db, 'appendEvent').mockResolvedValue(1);
+
+    await handleTrelloWebhook(env, {
+      action: {
+        type: 'updateCard',
+        data: { card: { id: 'card-1', name: 'Write report' }, listAfter: { id: 'backlog' } },
+      },
+    });
+
+    expect(echo).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith(env.DB, 42, { status: 'dropped', pending_prompt: null });
   });
 });
 
@@ -561,8 +705,99 @@ describe('recoverable outbound generations', () => {
     expect(fake.state).toMatchObject({
       status: 'sent',
       retryCount: 3,
-      attemptToken: null,
+      attemptToken: 'worker-new',
       messageId: 'SM-new',
+    });
+  });
+
+  it('durably applies a same-generation failure callback that races provider completion', async () => {
+    const fake = recoverableOutboundDb();
+    expect(await claimOutboundRetry(fake.db, 8, 2, 'worker-new', 1_100, 300)).toBe(true);
+
+    const correlate = setOutboundStatusByMessageId as unknown as (
+      database: D1Database,
+      messageId: string,
+      status: string,
+      outboundId: number,
+      attemptToken: string,
+    ) => Promise<boolean>;
+    await expect(correlate(fake.db, 'SM-new', 'failed', 8, 'worker-new')).rejects.toThrow(
+      'status callback not yet correlated',
+    );
+    expect(fake.state).toMatchObject({
+      status: 'retrying',
+      attemptToken: 'worker-new',
+    });
+
+    expect(await completeOutboundAttempt(fake.db, 8, 'worker-new', 'sent', 3)).toBe(true);
+    expect(await correlate(fake.db, 'SM-new', 'failed', 8, 'worker-new')).toBe(true);
+    expect(fake.state).toMatchObject({
+      status: 'failed',
+      retryCount: 3,
+      attemptToken: 'worker-new',
+      messageId: 'SM-old',
+    });
+    await expect(failedOutbound(fake.db, 1_101)).resolves.toHaveLength(1);
+    await expect(
+      claimOutboundRetry(fake.db, 8, 3, 'worker-next', 1_101, 300),
+    ).resolves.toBe(true);
+    expect(fake.state).toMatchObject({
+      status: 'retrying',
+      attemptToken: 'worker-next',
+      leaseUntil: 1_401,
+    });
+  });
+
+  it('accepts a current callback after completion but rejects an older generation', async () => {
+    const fake = recoverableOutboundDb();
+    expect(await claimOutboundRetry(fake.db, 8, 2, 'worker-new', 1_100, 300)).toBe(true);
+    expect(await completeOutboundAttempt(fake.db, 8, 'worker-new', 'failed', 3)).toBe(true);
+
+    const correlate = setOutboundStatusByMessageId as unknown as (
+      database: D1Database,
+      messageId: string,
+      status: string,
+      outboundId: number,
+      attemptToken: string,
+    ) => Promise<boolean>;
+    expect(await correlate(fake.db, 'SM-new', 'delivered', 8, 'worker-new')).toBe(true);
+    expect(await correlate(fake.db, 'SM-old', 'failed', 8, 'worker-old')).toBe(false);
+    expect(fake.state.status).toBe('delivered');
+    expect(fake.state.attemptToken).toBe('worker-new');
+  });
+
+  it('reapplies a current callback when completion wins between its update and generation read', async () => {
+    const fake = recoverableOutboundDb({ completeBeforeGenerationRead: true });
+    expect(await claimOutboundRetry(fake.db, 8, 2, 'worker-new', 1_100, 300)).toBe(true);
+
+    const correlate = setOutboundStatusByMessageId as unknown as (
+      database: D1Database,
+      messageId: string,
+      status: string,
+      outboundId: number,
+      attemptToken: string,
+    ) => Promise<boolean>;
+    await expect(
+      correlate(fake.db, 'SM-new', 'failed', 8, 'worker-new'),
+    ).resolves.toBe(true);
+    expect(fake.state).toMatchObject({
+      status: 'failed',
+      attemptToken: 'worker-new',
+      leaseUntil: 0,
+    });
+  });
+
+  it('reapplies a legacy callback when completion exposes its message ID during correlation', async () => {
+    const fake = recoverableOutboundDb({ completeBeforeMessageRead: true });
+
+    await expect(
+      setOutboundStatusByMessageId(fake.db, 'SM-new', 'failed'),
+    ).resolves.toBe(true);
+    expect(fake.state).toMatchObject({
+      status: 'failed',
+      messageId: 'SM-new',
+      attemptToken: 'worker-old',
+      leaseUntil: 0,
     });
   });
 
@@ -979,6 +1214,43 @@ describe('durable inbound failures', () => {
     expect(markProcessed).not.toHaveBeenCalled();
   });
 
+  it('keeps an unmatched status callback retryable until provider completion exposes its message ID', async () => {
+    const outbound = recoverableOutboundDb();
+    const database = outbound.db;
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000007');
+    vi.spyOn(db, 'tryInsertInbound').mockResolvedValue(true);
+    vi.spyOn(db, 'claimInbound').mockResolvedValue(true);
+    vi.spyOn(db, 'renewInboundClaim').mockResolvedValue(true);
+    vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
+    const recordFailure = vi.spyOn(db, 'recordInboundFailure').mockResolvedValue(false);
+    const markProcessed = vi.spyOn(db, 'markInboundProcessed').mockResolvedValue();
+    const inbound = {
+      kind: 'status',
+      status: 'failed',
+      refMessageId: 'SM-racing',
+      passthrough: null,
+      outboundId: 8,
+      attemptToken: 'worker-old',
+      dedupeId: 'status:SM-racing:failed',
+    } as const;
+
+    await expect(
+      processInbound(
+        { DB: database } as AppEnv,
+        inbound as unknown as Parameters<typeof processInbound>[1],
+      ),
+    ).rejects.toThrow('status callback not yet correlated');
+
+    expect(recordFailure).toHaveBeenCalledWith(
+      database,
+      inbound.dedupeId,
+      'status callback not yet correlated',
+      5,
+      '00000000-0000-4000-8000-000000000007',
+    );
+    expect(markProcessed).not.toHaveBeenCalled();
+  });
+
   it('records sweep exceptions without terminally processing retriable rows', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(Date.UTC(2026, 6, 28, 9, 0));
@@ -1152,12 +1424,96 @@ describe('owner profile synchronization', () => {
       QUIET_END: configuredUser.quiet_end,
       NAG_LEVEL: configuredUser.nag_level,
       PULSE_EVERY_MIN: String(configuredUser.pulse_every_min),
-    } as AppEnv;
+    } as unknown as AppEnv;
 
     const html = await runSetup(env, new URL('https://donna.example/setup'));
 
     expect(upsert).toHaveBeenCalledWith(database, configuredUser);
     expect(db.getUser).toHaveBeenCalledTimes(2);
     expect(html).toContain('tz America/New_York');
+  });
+
+  it.each([
+    ['TIMEZONE', 'Mars/Olympus'],
+    ['MORNING_TIME', '8:00'],
+    ['EVENING_TIME', '24:00'],
+    ['WORK_START', '09:60'],
+    ['WORK_END', '17:30Z'],
+    ['QUIET_START', ' 23:00'],
+    ['QUIET_END', '06:5'],
+    ['NAG_LEVEL', 'feral'],
+    ['PULSE_EVERY_MIN', 'Infinity'],
+    ['PULSE_EVERY_MIN', '12.5'],
+    ['PULSE_EVERY_MIN', '14'],
+    ['PULSE_EVERY_MIN', '9007199254740992'],
+  ])('preserves the prior profile when %s is invalid (%s)', async (field, invalidValue) => {
+    const priorUser: UserRow = {
+      id: 1,
+      contact: '+15550000000',
+      timezone: 'UTC',
+      morning_time: '09:00',
+      evening_time: '19:00',
+      work_start: '10:00',
+      work_end: '16:00',
+      quiet_start: '21:00',
+      quiet_end: '08:00',
+      nag_level: 'gentle',
+      pulse_every_min: 240,
+    };
+    const database = {} as D1Database;
+    vi.spyOn(db, 'setSetting').mockResolvedValue();
+    vi.spyOn(db, 'getUser').mockResolvedValue(priorUser);
+    const upsert = vi.spyOn(db, 'upsertUser').mockResolvedValue();
+    const env = {
+      DB: database,
+      OWNER_CONTACT: configuredUser.contact,
+      TIMEZONE: configuredUser.timezone,
+      MORNING_TIME: configuredUser.morning_time,
+      EVENING_TIME: configuredUser.evening_time,
+      WORK_START: configuredUser.work_start,
+      WORK_END: configuredUser.work_end,
+      QUIET_START: configuredUser.quiet_start,
+      QUIET_END: configuredUser.quiet_end,
+      NAG_LEVEL: configuredUser.nag_level,
+      PULSE_EVERY_MIN: String(configuredUser.pulse_every_min),
+      [field]: invalidValue,
+    } as unknown as AppEnv;
+
+    const html = await runSetup(env, new URL('https://donna.example/setup'));
+
+    expect(upsert).not.toHaveBeenCalled();
+    expect(db.getUser).toHaveBeenCalledOnce();
+    expect(html).toContain(field);
+    expect(html).toContain('existing profile preserved');
+    expect(html).toContain('Fix the ❌ rows above');
+  });
+});
+
+describe('Trello setup readiness', () => {
+  it('surfaces a missing signing secret and skips webhook registration', async () => {
+    const database = {} as D1Database;
+    vi.spyOn(db, 'setSetting').mockResolvedValue();
+    vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
+    vi.spyOn(trello, 'getMemberName').mockResolvedValue('Donna Owner');
+    vi.spyOn(trello, 'getLists').mockResolvedValue([
+      { id: 'today', name: 'Today' },
+      { id: 'done', name: 'Done' },
+    ]);
+    const register = vi.spyOn(trello, 'registerWebhook').mockResolvedValue('created');
+    const env = {
+      DB: database,
+      TRELLO_KEY: 'key',
+      TRELLO_TOKEN: 'token',
+      TRELLO_BOARD_ID: 'board',
+      WEBHOOK_TOKEN: 'public-token',
+    } as AppEnv;
+
+    const html = await runSetup(env, new URL('https://donna.example/setup'));
+
+    expect(html).toContain('Trello signing secret (TRELLO_APP_SECRET)');
+    expect(html).toContain('missing');
+    expect(html).toContain('Trello webhook');
+    expect(html).toContain('not registered');
+    expect(register).not.toHaveBeenCalled();
   });
 });

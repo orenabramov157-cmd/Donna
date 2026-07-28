@@ -74,15 +74,20 @@ Skip this if you don't use Trello — the bot works standalone. Otherwise:
 4. On that same page, click the **Token** link (right of the API key) → **Allow** → copy the token.
 5. Back in Cloudflare **Variables and Secrets**, add four more Secrets: `TRELLO_KEY`, `TRELLO_TOKEN`, `TRELLO_BOARD_ID`, `TRELLO_APP_SECRET` (paste each directly). The App Secret verifies signed Trello webhook POSTs.
 
-✅ **Check:** nine secrets listed in total.
+`TRELLO_APP_SECRET` is required whenever Trello is configured. The setup page will not register or report the Trello webhook ready without it, because every callback POST would otherwise be rejected.
+
+✅ **Check:** nine secrets listed in total, including `TRELLO_APP_SECRET`.
 
 ## Step 7 — Your timezone and schedule
 
 Still in **Settings → Variables and Secrets**, the plain-text **variables** control the schedule. Edit if needed (then Deploy):
 
 - `TIMEZONE` — IANA name, e.g. `America/Chicago`, `America/Los_Angeles`
-- `MORNING_TIME` (default 08:00), `EVENING_TIME` (20:30), `WORK_START`/`WORK_END`, `QUIET_START`/`QUIET_END`
+- `MORNING_TIME` (default 08:00), `EVENING_TIME` (20:30), `WORK_START`/`WORK_END`, `QUIET_START`/`QUIET_END` — each must be exact 24-hour `HH:MM`
 - `NAG_LEVEL` — `gentle` / `standard` / `relentless` (changeable later by texting the bot)
+- `PULSE_EVERY_MIN` — whole minutes between pulse checks, minimum `15` (default `150`)
+
+`/setup` validates the entire profile before saving any of it. If one value is invalid, the page names the bad variable and leaves the previous profile unchanged.
 
 ## Step 8 — Run setup
 
@@ -125,7 +130,7 @@ Reply **`help`** to see the commands. Reply **`plan`** to plan your first day.
 
 - **No texts?** `/health` should show a recent `last_cron_at`. Check LoopMessage's webhook history in their dashboard, and Cloudflare → your Worker → **Logs** (live tail).
 - **Bot doesn't answer replies?** Check LoopMessage's **API → Webhooks history** page. "No data" = the *Sandbox* webhook fields were never filled (Step 8 — they're on the Sandbox page, not API Settings). Rows showing **failed 401** = the header value doesn't exactly match your `LOOP_WEBHOOK_AUTH` secret — re-paste it cleanly, Save sandbox, then press **Retry** on the failed rows.
-- **Trello not syncing?** Re-run `/setup` — it re-registers the board webhook and re-resolves the Today/Done lists.
+- **Trello not syncing?** Re-run `/setup` — it checks `TRELLO_APP_SECRET`, re-registers the signed board webhook, and re-resolves the Today/Done lists.
 - **Changed a secret?** Re-run `/setup` afterwards.
 - Setup page is safe to re-run anytime; it never duplicates anything.
 

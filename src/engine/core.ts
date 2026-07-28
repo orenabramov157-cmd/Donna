@@ -73,7 +73,7 @@ import {
   registerWebhook,
   trelloConfigured,
 } from '../trello';
-import { getChannel, type Inbound, type SendOpts } from '../channel';
+import { encodeDeliveryAttemptMetadata, getChannel, type Inbound, type SendOpts } from '../channel';
 
 const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'chat', 'misc'];
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
@@ -205,12 +205,23 @@ interface Ctx {
   today: string;
 }
 
-async function deliverySendOpts(env: AppEnv, db: D1Database, taskId?: number | null): Promise<SendOpts | undefined> {
+async function deliverySendOpts(
+  env: AppEnv,
+  db: D1Database,
+  outboundId: number,
+  attemptToken: string,
+  taskId?: number | null,
+): Promise<SendOpts> {
   const origin = await getSetting(db, 'public_origin');
-  const statusCallbackUrl = origin && env.WEBHOOK_TOKEN ? `${origin}/webhook/loop/${env.WEBHOOK_TOKEN}` : undefined;
-  if (!taskId && !statusCallbackUrl) return undefined;
+  let statusCallbackUrl: string | undefined;
+  if (origin && env.WEBHOOK_TOKEN) {
+    const callback = new URL(`${origin}/webhook/loop/${env.WEBHOOK_TOKEN}`);
+    callback.searchParams.set('outbound_id', String(outboundId));
+    callback.searchParams.set('attempt_token', attemptToken);
+    statusCallbackUrl = callback.toString();
+  }
   return {
-    ...(taskId ? { passthrough: `task:${taskId}` } : {}),
+    passthrough: encodeDeliveryAttemptMetadata(outboundId, attemptToken, taskId ?? null),
     ...(statusCallbackUrl ? { statusCallbackUrl } : {}),
   };
 }
@@ -275,7 +286,7 @@ async function dispatchOutboundAttempt(
       c.env,
       c.user.contact,
       body,
-      await deliverySendOpts(c.env, c.db, taskId),
+      await deliverySendOpts(c.env, c.db, id, claimToken, taskId),
     );
     if (await heartbeat.stop()) {
       await completeOutboundAttempt(c.db, id, claimToken, res ? 'sent' : 'failed', retryCount, res?.messageId);
@@ -1113,11 +1124,13 @@ async function handleInboundCore(env: AppEnv, inbound: Inbound, now: number): Pr
   if (!c) return 'no user configured (run /setup)';
 
   if (inbound.kind === 'status') {
-    if (inbound.refMessageId) {
+    if (inbound.refMessageId || (inbound.outboundId && inbound.attemptToken)) {
       await setOutboundStatusByMessageId(
         c.db,
         inbound.refMessageId,
         inbound.status === 'failed' ? 'failed' : 'delivered',
+        inbound.outboundId,
+        inbound.attemptToken,
       );
     }
     return undefined;
@@ -1167,10 +1180,12 @@ export async function handleTrelloWebhook(env: AppEnv, body: unknown): Promise<v
   if (!c) return;
   const action = parseTrelloAction(body);
   if (!action) return;
+  const todayListId = await getSetting(c.db, 'trello_today_list_id');
+  const doneListId = await getSetting(c.db, 'trello_done_list_id');
   const expectedEcho =
     action.t === 'created'
       ? { kind: 'trello_create', detail: action.name }
-      : action.t === 'moved'
+      : action.t === 'moved' && doneListId !== null && action.toListId === doneListId
         ? { kind: 'trello_move', detail: 'done' }
         : action.t === 'archived'
           ? { kind: 'trello_archive', detail: 'drop' }
@@ -1182,8 +1197,6 @@ export async function handleTrelloWebhook(env: AppEnv, body: unknown): Promise<v
     return;
   }
 
-  const todayListId = await getSetting(c.db, 'trello_today_list_id');
-  const doneListId = await getSetting(c.db, 'trello_done_list_id');
   const session = await ensureSession(c.db, c.today);
 
   if (action.t === 'created') {
@@ -1512,6 +1525,66 @@ function esc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+interface ProfileConfig {
+  value: Omit<UserRow, 'id'>;
+  errors: string[];
+}
+
+function profileConfigFromEnv(env: AppEnv): ProfileConfig {
+  const timezone = env.TIMEZONE ?? 'America/Los_Angeles';
+  const morningTime = env.MORNING_TIME ?? '08:00';
+  const eveningTime = env.EVENING_TIME ?? '20:30';
+  const workStart = env.WORK_START ?? '09:00';
+  const workEnd = env.WORK_END ?? '18:00';
+  const quietStart = env.QUIET_START ?? '22:00';
+  const quietEnd = env.QUIET_END ?? '07:30';
+  const nagLevel = env.NAG_LEVEL ?? 'standard';
+  const pulseEveryMin = Number(env.PULSE_EVERY_MIN ?? '150');
+  const errors: string[] = [];
+
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(0);
+  } catch {
+    errors.push('TIMEZONE must be a valid IANA timezone');
+  }
+
+  const timeFields = [
+    ['MORNING_TIME', morningTime],
+    ['EVENING_TIME', eveningTime],
+    ['WORK_START', workStart],
+    ['WORK_END', workEnd],
+    ['QUIET_START', quietStart],
+    ['QUIET_END', quietEnd],
+  ] as const;
+  for (const [name, value] of timeFields) {
+    if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+      errors.push(`${name} must be strict HH:MM (00:00–23:59)`);
+    }
+  }
+  if (!(['gentle', 'standard', 'relentless'] as string[]).includes(nagLevel)) {
+    errors.push('NAG_LEVEL must be gentle, standard, or relentless');
+  }
+  if (!Number.isSafeInteger(pulseEveryMin) || pulseEveryMin < 15) {
+    errors.push('PULSE_EVERY_MIN must be a safe integer of at least 15');
+  }
+
+  return {
+    value: {
+      contact: env.OWNER_CONTACT ?? '',
+      timezone,
+      morning_time: morningTime,
+      evening_time: eveningTime,
+      work_start: workStart,
+      work_end: workEnd,
+      quiet_start: quietStart,
+      quiet_end: quietEnd,
+      nag_level: nagLevel,
+      pulse_every_min: pulseEveryMin,
+    },
+    errors,
+  };
+}
+
 export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
   const steps: SetupStep[] = [];
   const origin = requestUrl.origin;
@@ -1522,23 +1595,23 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
   steps.push({ name: 'Database schema', ok: true, note: 'migrations applied' });
 
   let user = await getUser(env.DB);
+  let profileErrors: string[] = [];
   if (env.OWNER_CONTACT) {
-    await upsertUser(env.DB, {
-      contact: env.OWNER_CONTACT,
-      timezone: env.TIMEZONE || 'America/Los_Angeles',
-      morning_time: env.MORNING_TIME || '08:00',
-      evening_time: env.EVENING_TIME || '20:30',
-      work_start: env.WORK_START || '09:00',
-      work_end: env.WORK_END || '18:00',
-      quiet_start: env.QUIET_START || '22:00',
-      quiet_end: env.QUIET_END || '07:30',
-      nag_level: env.NAG_LEVEL || 'standard',
-      pulse_every_min: Number(env.PULSE_EVERY_MIN || '150'),
-    });
-    user = await getUser(env.DB);
+    const configured = profileConfigFromEnv(env);
+    profileErrors = configured.errors;
+    if (profileErrors.length === 0) {
+      await upsertUser(env.DB, configured.value);
+      user = await getUser(env.DB);
+    }
   }
-  const contactNote = user ? `owner ···${user.contact.slice(-4)}, tz ${user.timezone}` : 'set the OWNER_CONTACT secret, then reload';
-  steps.push({ name: 'Owner profile', ok: Boolean(user), note: contactNote });
+  const profileReady = Boolean(user && profileErrors.length === 0);
+  const contactNote =
+    profileErrors.length > 0
+      ? `invalid configuration — ${profileErrors.join('; ')}; existing profile preserved`
+      : user
+        ? `owner ···${user.contact.slice(-4)}, tz ${user.timezone}`
+        : 'set the OWNER_CONTACT secret, then reload';
+  steps.push({ name: 'Owner profile', ok: profileReady, note: contactNote });
 
   steps.push({
     name: 'iMessage credentials (LOOP_AUTH_KEY)',
@@ -1552,6 +1625,12 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
   });
 
   if (trelloConfigured(env)) {
+    const signingSecretReady = Boolean(env.TRELLO_APP_SECRET);
+    steps.push({
+      name: 'Trello signing secret (TRELLO_APP_SECRET)',
+      ok: signingSecretReady,
+      note: signingSecretReady ? 'present' : 'missing — callback POSTs cannot be verified',
+    });
     const member = await getMemberName(env);
     steps.push({ name: 'Trello auth', ok: Boolean(member), note: member ? `authed as ${member}` : 'key/token rejected' });
     const lists = await getLists(env);
@@ -1570,10 +1649,16 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
             ? `"${today.name}" and "${done.name}" resolved`
             : `board needs lists named "${env.TRELLO_TODAY_LIST || 'Today'}" and "${env.TRELLO_DONE_LIST || 'Done'}"`,
       });
-      if (env.WEBHOOK_TOKEN) {
+      if (env.WEBHOOK_TOKEN && signingSecretReady) {
         const cb = `${origin}/webhook/trello/${env.WEBHOOK_TOKEN}`;
         const wh = await registerWebhook(env, cb);
         steps.push({ name: 'Trello webhook', ok: wh !== 'failed', note: wh });
+      } else if (!signingSecretReady) {
+        steps.push({
+          name: 'Trello webhook',
+          ok: false,
+          note: 'not registered — add TRELLO_APP_SECRET first',
+        });
       }
     } else {
       steps.push({ name: 'Trello lists', ok: false, note: 'could not load board lists' });
@@ -1582,7 +1667,7 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
     steps.push({ name: 'Trello (optional)', ok: true, note: 'not configured — bot runs standalone' });
   }
 
-  const coreReady = Boolean(user && env.LOOP_AUTH_KEY && env.LOOP_WEBHOOK_AUTH && env.WEBHOOK_TOKEN);
+  const coreReady = Boolean(profileReady && env.LOOP_AUTH_KEY && env.LOOP_WEBHOOK_AUTH && env.WEBHOOK_TOKEN);
   if (sendTest && coreReady && user) {
     const res = await getChannel(env).send(env, user.contact, copy.SETUP_TEST);
     steps.push({ name: 'Test message', ok: Boolean(res), note: res ? 'sent — check your phone' : 'send failed (see logs)' });

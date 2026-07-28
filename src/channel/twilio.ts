@@ -64,11 +64,22 @@ export const twilio: Channel = {
     const sid = params['MessageSid'] ?? params['SmsSid'] ?? crypto.randomUUID();
     const status = params['MessageStatus'];
     if (status === 'delivered' || status === 'failed' || status === 'undelivered') {
+      const callbackUrl = new URL(request.url);
+      const outboundIdRaw = callbackUrl.searchParams.get('outbound_id');
+      const parsedOutboundId = outboundIdRaw === null ? NaN : Number(outboundIdRaw);
+      const attemptToken = callbackUrl.searchParams.get('attempt_token');
+      const hasAttempt =
+        Number.isSafeInteger(parsedOutboundId) &&
+        parsedOutboundId > 0 &&
+        typeof attemptToken === 'string' &&
+        attemptToken.length > 0;
       return {
         kind: 'status',
         status: status === 'delivered' ? 'delivered' : 'failed',
         refMessageId: sid,
         passthrough: null,
+        outboundId: hasAttempt ? parsedOutboundId : null,
+        attemptToken: hasAttempt ? attemptToken : null,
         dedupeId: `status:${sid}:${status}`,
       };
     }

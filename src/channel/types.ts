@@ -12,6 +12,8 @@ export type Inbound =
       status: 'delivered' | 'failed';
       refMessageId: string | null;
       passthrough: string | null;
+      outboundId: number | null;
+      attemptToken: string | null;
       dedupeId: string;
     }
   | { kind: 'ignored'; reason: string; dedupeId: string };
@@ -20,6 +22,41 @@ export interface SendOpts {
   passthrough?: string;
   replyToId?: string;
   statusCallbackUrl?: string;
+}
+
+export interface DeliveryAttemptMetadata {
+  v: 1;
+  outboundId: number;
+  attemptToken: string;
+  taskId: number | null;
+}
+
+export function encodeDeliveryAttemptMetadata(
+  outboundId: number,
+  attemptToken: string,
+  taskId: number | null,
+): string {
+  return JSON.stringify({ v: 1, outboundId, attemptToken, taskId } satisfies DeliveryAttemptMetadata);
+}
+
+export function decodeDeliveryAttemptMetadata(raw: string | null): DeliveryAttemptMetadata | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<DeliveryAttemptMetadata>;
+    if (
+      parsed.v !== 1 ||
+      !Number.isSafeInteger(parsed.outboundId) ||
+      Number(parsed.outboundId) <= 0 ||
+      typeof parsed.attemptToken !== 'string' ||
+      parsed.attemptToken.length === 0 ||
+      (parsed.taskId !== null && (!Number.isSafeInteger(parsed.taskId) || Number(parsed.taskId) <= 0))
+    ) {
+      return null;
+    }
+    return parsed as DeliveryAttemptMetadata;
+  } catch {
+    return null;
+  }
 }
 
 export interface Channel {

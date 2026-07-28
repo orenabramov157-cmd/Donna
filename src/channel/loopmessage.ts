@@ -3,7 +3,7 @@
 
 import type { AppEnv } from '../env';
 import type { Channel, Inbound } from './types';
-import { timingSafeEqualStr } from './types';
+import { decodeDeliveryAttemptMetadata, timingSafeEqualStr } from './types';
 
 const SEND_URL = 'https://a.loopmessage.com/api/v1/message/send/';
 
@@ -84,11 +84,15 @@ export const loopMessage: Channel = {
       return reactionInbound(b, from, dedupeId);
     }
     if (event === 'message_delivered' || event === 'message_failed') {
+      const passthrough = str(b.passthrough);
+      const attempt = decodeDeliveryAttemptMetadata(passthrough);
       return {
         kind: 'status',
         status: event === 'message_failed' ? 'failed' : 'delivered',
         refMessageId: messageId,
-        passthrough: str(b.passthrough),
+        passthrough,
+        outboundId: attempt?.outboundId ?? null,
+        attemptToken: attempt?.attemptToken ?? null,
         dedupeId,
       };
     }

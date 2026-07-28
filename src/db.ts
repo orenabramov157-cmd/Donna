@@ -852,7 +852,7 @@ export async function completeOutboundAttempt(
     .prepare(
       `UPDATE outbound_log
        SET status = ?, retry_count = ?, channel_message_id = COALESCE(?, channel_message_id),
-           attempt_token = NULL, lease_until_utc = NULL
+           lease_until_utc = NULL
        WHERE id = ? AND status = 'retrying' AND attempt_token = ?
        RETURNING id`,
     )
@@ -883,18 +883,59 @@ export async function renewOutboundAttempt(
 
 export async function setOutboundStatusByMessageId(
   db: D1Database,
-  messageId: string,
+  messageId: string | null,
   status: string,
+  outboundId?: number | null,
+  attemptToken?: string | null,
 ): Promise<boolean> {
-  const updated = await db
-    .prepare(
-      `UPDATE outbound_log SET status = ?
-       WHERE channel_message_id = ? AND attempt_token IS NULL AND status != 'retrying'
-       RETURNING id`,
-    )
-    .bind(status, messageId)
-    .first<{ id: number }>();
-  return updated !== null;
+  if (
+    Number.isSafeInteger(outboundId) &&
+    Number(outboundId) > 0 &&
+    typeof attemptToken === 'string' &&
+    attemptToken.length > 0
+  ) {
+    const updateGeneration = (): Promise<{ id: number } | null> =>
+      db
+        .prepare(
+          `UPDATE outbound_log SET status = ?
+           WHERE id = ? AND attempt_token = ? AND status != 'retrying'
+           RETURNING id`,
+        )
+        .bind(status, outboundId, attemptToken)
+        .first<{ id: number }>();
+    const updatedGeneration = await updateGeneration();
+    if (updatedGeneration) return true;
+
+    const current = await db
+      .prepare(`SELECT id, status, attempt_token FROM outbound_log WHERE id = ?`)
+      .bind(outboundId)
+      .first<Pick<OutboundRow, 'id' | 'status' | 'attempt_token'>>();
+    if (current?.status === 'retrying' && current.attempt_token === attemptToken) {
+      throw new Error('status callback not yet correlated');
+    }
+    if (current?.attempt_token === attemptToken) {
+      return (await updateGeneration()) !== null;
+    }
+    return false;
+  }
+
+  if (!messageId) return false;
+  const updateMessage = (): Promise<{ id: number } | null> =>
+    db
+      .prepare(
+        `UPDATE outbound_log SET status = ?
+         WHERE channel_message_id = ? AND status != 'retrying'
+         RETURNING id`,
+      )
+      .bind(status, messageId)
+      .first<{ id: number }>();
+  const updated = await updateMessage();
+  if (updated) return true;
+
+  const current = await outboundByMessageId(db, messageId);
+  if (!current) throw new Error('status callback not yet correlated');
+  if (current.status !== 'retrying') return (await updateMessage()) !== null;
+  return false;
 }
 
 export async function claimOutboundRetry(
@@ -912,7 +953,7 @@ export async function claimOutboundRetry(
        SET status = 'retrying', attempt_token = ?, lease_until_utc = ?
        WHERE id = ? AND retry_count = ? AND retry_count < 5
        AND (
-         (status = 'failed' AND attempt_token IS NULL)
+         status = 'failed'
          OR (status = 'retrying' AND COALESCE(lease_until_utc, 0) <= ?)
        )
        RETURNING id, attempt_token`,
@@ -927,7 +968,7 @@ export async function failedOutbound(db: D1Database, nowUtc: number, limit = 5):
     .prepare(
       `SELECT * FROM outbound_log
        WHERE retry_count < 5 AND (
-         (status = 'failed' AND attempt_token IS NULL)
+         status = 'failed'
          OR (status = 'retrying' AND COALESCE(lease_until_utc, 0) <= ?)
        )
        ORDER BY at_utc ASC LIMIT ?`,
