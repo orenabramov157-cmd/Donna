@@ -70,11 +70,11 @@ Skip this if you don't use Trello — the bot works standalone. Otherwise:
 
 1. Make sure the board you'll use has a list named **Today** and a list named **Done** (create them if needed).
 2. Get the board's full ID: open the board in your browser and add `.json` to the end of the URL. The first `"id"` value (24 characters) is your board ID. Copy it.
-3. Go to [trello.com/power-ups/admin](https://trello.com/power-ups/admin) → **New** → fill in anything (name: "accountability-bot", your workspace) → open it → **API key** tab → **Generate a new API key**. Copy the key.
+3. Go to [trello.com/power-ups/admin](https://trello.com/power-ups/admin) → **New** → fill in anything (name: "accountability-bot", your workspace) → open it → **API key** tab → **Generate a new API key**. Copy the key and the **App Secret** shown on that page.
 4. On that same page, click the **Token** link (right of the API key) → **Allow** → copy the token.
-5. Back in Cloudflare **Variables and Secrets**, add three more Secrets: `TRELLO_KEY`, `TRELLO_TOKEN`, `TRELLO_BOARD_ID` (paste each directly).
+5. Back in Cloudflare **Variables and Secrets**, add four more Secrets: `TRELLO_KEY`, `TRELLO_TOKEN`, `TRELLO_BOARD_ID`, `TRELLO_APP_SECRET` (paste each directly). The App Secret verifies signed Trello webhook POSTs.
 
-✅ **Check:** eight secrets listed in total.
+✅ **Check:** nine secrets listed in total.
 
 ## Step 7 — Your timezone and schedule
 
@@ -134,5 +134,6 @@ Reply **`help`** to see the commands. Reply **`plan`** to plan your first day.
 1. Buy a number at Twilio (~$1.15/mo) and complete their US A2P registration (~$19 one-time, ~$2/mo).
 2. In Cloudflare, add Secrets `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM` (your Twilio number).
 3. Change the `CHANNEL` variable to `twilio` and Deploy.
-4. In Twilio's console, set the number's incoming-message webhook to `https://YOUR-WORKER-URL/webhook/loop/YOUR_WEBHOOK_TOKEN` (yes, the same path).
-5. Text the bot — everything else is identical.
+4. Run `/setup` once after deploying. It records the Worker origin and derives the status-callback URL `https://YOUR-WORKER-URL/webhook/loop/YOUR_WEBHOOK_TOKEN` for outgoing SMS delivery updates.
+5. In Twilio's console, set the number's incoming-message webhook to that same URL.
+6. Text the bot — everything else is identical.

@@ -13,9 +13,11 @@ OWNER_CONTACT = "+13105551234"
 
 # Trello: https://trello.com/power-ups/admin -> new Power-Up -> API key,
 # then generate a token from the key page. Board ID is in the board URL or /setup will help.
+# App Secret is shown on the same API key page; it verifies signed Trello webhook POSTs.
 TRELLO_KEY = ""
 TRELLO_TOKEN = ""
 TRELLO_BOARD_ID = ""
+TRELLO_APP_SECRET = ""
 
 # Guards for the bot's own URLs. Generate two long random strings (e.g. `openssl rand -hex 24`).
 SETUP_KEY = ""
@@ -25,3 +27,5 @@ WEBHOOK_TOKEN = ""
 # TWILIO_ACCOUNT_SID = ""
 # TWILIO_AUTH_TOKEN = ""
 # TWILIO_FROM = "+1..."
+# Re-run /setup after deployment. It records the Worker origin so outgoing SMS
+# StatusCallback requests return to /webhook/loop/YOUR_WEBHOOK_TOKEN.

@@ -800,10 +800,21 @@ export async function outboundByMessageId(db: D1Database, messageId: string): Pr
     .first<OutboundRow>();
 }
 
-export async function recentTrelloEcho(db: D1Database, cardId: string, sinceUtc: number): Promise<boolean> {
+export async function recentTrelloEcho(
+  db: D1Database,
+  cardId: string,
+  sinceUtc: number,
+  expectedKind: string,
+  detail?: string,
+): Promise<boolean> {
   const row = await db
-    .prepare(`SELECT id FROM outbound_log WHERE trello_card_id = ? AND at_utc >= ? LIMIT 1`)
-    .bind(cardId, sinceUtc)
+    .prepare(
+      `SELECT id FROM outbound_log
+       WHERE trello_card_id = ? AND at_utc >= ? AND kind = ?
+       AND (? IS NULL OR body = ?)
+       LIMIT 1`,
+    )
+    .bind(cardId, sinceUtc, expectedKind, detail ?? null, detail ?? null)
     .first<{ id: number }>();
   return row !== null;
 }

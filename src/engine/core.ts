@@ -1167,7 +1167,20 @@ export async function handleTrelloWebhook(env: AppEnv, body: unknown): Promise<v
   if (!c) return;
   const action = parseTrelloAction(body);
   if (!action) return;
-  if (await recentTrelloEcho(c.db, action.cardId, c.now - 10 * 60_000)) return;
+  const expectedEcho =
+    action.t === 'created'
+      ? { kind: 'trello_create', detail: action.name }
+      : action.t === 'moved'
+        ? { kind: 'trello_move', detail: 'done' }
+        : action.t === 'archived'
+          ? { kind: 'trello_archive', detail: 'drop' }
+          : null;
+  if (
+    expectedEcho &&
+    (await recentTrelloEcho(c.db, action.cardId, c.now - 10 * 60_000, expectedEcho.kind, expectedEcho.detail))
+  ) {
+    return;
+  }
 
   const todayListId = await getSetting(c.db, 'trello_today_list_id');
   const doneListId = await getSetting(c.db, 'trello_done_list_id');

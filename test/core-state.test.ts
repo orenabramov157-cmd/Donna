@@ -22,7 +22,7 @@ import {
   upsertUser,
 } from '../src/db';
 import { aiBudgetOk } from '../src/parse';
-import { processInbound, runSetup, tick } from '../src/engine/core';
+import { handleTrelloWebhook, processInbound, runSetup, tick } from '../src/engine/core';
 
 vi.mock('../src/schema', () => ({ ensureSchema: vi.fn() }));
 
@@ -429,6 +429,61 @@ function atomicLogicalOutboundDb(updateChanges: number) {
     batch,
   };
 }
+
+describe('Trello webhook echo correlation', () => {
+  it('suppresses a create echo without suppressing a subsequent move to Done', async () => {
+    const env = { DB: {} as D1Database } as AppEnv;
+    vi.spyOn(db, 'recentTrelloEcho').mockImplementation(async (_db, _cardId, _sinceUtc, kind) => kind === 'trello_create');
+    vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
+    vi.spyOn(db, 'getSetting').mockImplementation(async (_db, key) => {
+      if (key === 'trello_today_list_id') return 'today';
+      if (key === 'trello_done_list_id') return 'done';
+      return null;
+    });
+    vi.spyOn(db, 'ensureSession').mockResolvedValue({
+      local_date: '2026-07-28',
+      plan_state: 'unplanned',
+      prompted_at_utc: null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null,
+      weekly_sent: 0,
+    });
+    const taskByCard = vi.spyOn(db, 'taskByCard').mockResolvedValue(null);
+    vi.spyOn(db, 'createTask').mockResolvedValue(1);
+    vi.spyOn(db, 'appendEvent').mockResolvedValue(1);
+
+    await handleTrelloWebhook(env, {
+      action: {
+        type: 'createCard',
+        data: { card: { id: 'card-1', name: 'Write report' }, list: { id: 'today' } },
+      },
+    });
+    await handleTrelloWebhook(env, {
+      action: {
+        type: 'updateCard',
+        data: { card: { id: 'card-1', name: 'Write report' }, listAfter: { id: 'done' } },
+      },
+    });
+
+    expect(taskByCard).toHaveBeenCalledTimes(1);
+    expect(db.recentTrelloEcho).toHaveBeenNthCalledWith(
+      1,
+      env.DB,
+      'card-1',
+      expect.any(Number),
+      'trello_create',
+      'Write report',
+    );
+    expect(db.recentTrelloEcho).toHaveBeenNthCalledWith(
+      2,
+      env.DB,
+      'card-1',
+      expect.any(Number),
+      'trello_move',
+      'done',
+    );
+  });
+});
 
 describe('recoverable outbound generations', () => {
   it('leaves a leased session outbound row recoverable after hard termination before dispatch', async () => {
