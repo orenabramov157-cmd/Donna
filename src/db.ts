@@ -290,13 +290,15 @@ export async function markInboundProcessed(
   claimToken?: string,
 ): Promise<void> {
   if (claimToken !== undefined) {
+    const now = Date.now();
     await db
       .prepare(
         `UPDATE inbound_events SET processed_at_utc = ?, error = ?
          WHERE dedupe_id = ? AND processed_at_utc IS NULL
-         AND json_valid(error) AND json_extract(error, '$.leaseToken') = ?`,
+         AND json_valid(error) AND json_extract(error, '$.leaseToken') = ?
+         AND COALESCE(CAST(json_extract(error, '$.leaseUntil') AS INTEGER), 0) > ?`,
       )
-      .bind(Date.now(), error ?? null, dedupeId, claimToken)
+      .bind(now, error ?? null, dedupeId, claimToken, now)
       .run();
     return;
   }
@@ -387,6 +389,28 @@ export async function claimInbound(
   return claimed !== null && claimed.processed_at_utc === null && claimed.lease_token === claimToken;
 }
 
+export async function renewInboundClaim(
+  db: D1Database,
+  dedupeId: string,
+  claimToken: string,
+  nowUtc: number,
+  leaseMs: number,
+): Promise<boolean> {
+  const leaseDuration = Number.isFinite(leaseMs) ? Math.max(1, Math.floor(leaseMs)) : 1;
+  const renewed = await db
+    .prepare(
+      `UPDATE inbound_events
+       SET error = json_set(error, '$.leaseUntil', ?)
+       WHERE dedupe_id = ? AND processed_at_utc IS NULL
+       AND json_valid(error) AND json_extract(error, '$.leaseToken') = ?
+       AND COALESCE(CAST(json_extract(error, '$.leaseUntil') AS INTEGER), 0) > ?
+       RETURNING dedupe_id`,
+    )
+    .bind(nowUtc + leaseDuration, dedupeId, claimToken, nowUtc)
+    .first<{ dedupe_id: string }>();
+  return renewed !== null;
+}
+
 export async function recordInboundFailure(
   db: D1Database,
   dedupeId: string,
@@ -396,6 +420,7 @@ export async function recordInboundFailure(
 ): Promise<boolean> {
   const attemptLimit = Number.isFinite(maxAttempts) ? Math.max(1, Math.floor(maxAttempts)) : 1;
   if (claimToken !== null) {
+    const now = Date.now();
     const transition = await db
       .prepare(
         `UPDATE inbound_events
@@ -428,9 +453,10 @@ export async function recordInboundFailure(
          WHERE dedupe_id = ? AND processed_at_utc IS NULL
          AND ? IS NOT NULL
          AND json_valid(error) AND json_extract(error, '$.leaseToken') = ?
+         AND COALESCE(CAST(json_extract(error, '$.leaseUntil') AS INTEGER), 0) > ?
          RETURNING processed_at_utc`,
       )
-      .bind(attemptLimit, Date.now(), attemptLimit, error, dedupeId, claimToken, claimToken)
+      .bind(attemptLimit, now, attemptLimit, error, dedupeId, claimToken, claimToken, now)
       .first<{ processed_at_utc: number | null }>();
     return transition !== null && transition.processed_at_utc !== null;
   }

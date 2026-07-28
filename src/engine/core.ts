@@ -25,6 +25,7 @@ import {
   recentOutboundBodies,
   recentTrelloEcho,
   recordInboundFailure,
+  renewInboundClaim,
   setOutboundStatus,
   setSetting,
   stuckTasks,
@@ -71,6 +72,73 @@ const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', '
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
 const MAX_INBOUND_ATTEMPTS = 5;
 const INBOUND_LEASE_MS = 5 * 60_000;
+
+interface InboundLeaseHeartbeat {
+  stop(): Promise<boolean>;
+}
+
+function startInboundLeaseHeartbeat(
+  db: D1Database,
+  dedupeId: string,
+  claimToken: string,
+  leaseMs: number,
+): InboundLeaseHeartbeat {
+  let stopped = false;
+  let ownershipLost = false;
+  let renewal: Promise<void> | null = null;
+  let stopPromise: Promise<boolean> | null = null;
+  const intervalMs = Math.max(1_000, Math.floor(leaseMs / 3));
+
+  const logRenewalFailure = (err: unknown): void => {
+    console.error(
+      JSON.stringify({
+        evt: 'inbound_lease_renew_failed',
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  };
+
+  const renew = (): void => {
+    if (stopped || ownershipLost || renewal) return;
+    const active = renewInboundClaim(db, dedupeId, claimToken, Date.now(), leaseMs)
+      .then(
+        (owned) => {
+          if (!owned) ownershipLost = true;
+        },
+        (err: unknown) => {
+          ownershipLost = true;
+          logRenewalFailure(err);
+        },
+      )
+      .finally(() => {
+        if (renewal === active) renewal = null;
+      });
+    renewal = active;
+  };
+
+  const timer = setInterval(renew, intervalMs);
+  return {
+    stop(): Promise<boolean> {
+      if (stopPromise) return stopPromise;
+      stopped = true;
+      clearInterval(timer);
+      stopPromise = (async () => {
+        if (renewal) await renewal;
+        if (ownershipLost) return false;
+        try {
+          const owned = await renewInboundClaim(db, dedupeId, claimToken, Date.now(), leaseMs);
+          if (!owned) ownershipLost = true;
+          return owned;
+        } catch (err) {
+          ownershipLost = true;
+          logRenewalFailure(err);
+          return false;
+        }
+      })();
+      return stopPromise;
+    },
+  };
+}
 
 interface Ctx {
   env: AppEnv;
@@ -948,18 +1016,23 @@ export async function processInbound(env: AppEnv, inbound: Inbound): Promise<voi
   const now = Date.now();
   const claimToken = crypto.randomUUID();
   if (!(await claimInbound(env.DB, inbound.dedupeId, claimToken, now, INBOUND_LEASE_MS, MAX_INBOUND_ATTEMPTS))) return;
+  const heartbeat = startInboundLeaseHeartbeat(env.DB, inbound.dedupeId, claimToken, INBOUND_LEASE_MS);
   try {
     const note = await handleInboundCore(env, inbound, now);
-    await markInboundProcessed(env.DB, inbound.dedupeId, note, claimToken);
+    if (await heartbeat.stop()) await markInboundProcessed(env.DB, inbound.dedupeId, note, claimToken);
   } catch (err) {
-    await recordInboundFailure(
-      env.DB,
-      inbound.dedupeId,
-      err instanceof Error ? err.message : String(err),
-      MAX_INBOUND_ATTEMPTS,
-      claimToken,
-    );
+    if (await heartbeat.stop()) {
+      await recordInboundFailure(
+        env.DB,
+        inbound.dedupeId,
+        err instanceof Error ? err.message : String(err),
+        MAX_INBOUND_ATTEMPTS,
+        claimToken,
+      );
+    }
     throw err;
+  } finally {
+    await heartbeat.stop();
   }
 }
 
@@ -1163,18 +1236,24 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   const stale = await unprocessedInbound(c.db, c.now - 90_000);
   for (const row of stale) {
     const claimToken = crypto.randomUUID();
-    if (!(await claimInbound(c.db, row.dedupe_id, claimToken, c.now, INBOUND_LEASE_MS, MAX_INBOUND_ATTEMPTS))) continue;
+    const claimNow = Date.now();
+    if (!(await claimInbound(c.db, row.dedupe_id, claimToken, claimNow, INBOUND_LEASE_MS, MAX_INBOUND_ATTEMPTS))) continue;
+    const heartbeat = startInboundLeaseHeartbeat(c.db, row.dedupe_id, claimToken, INBOUND_LEASE_MS);
     try {
       const note = await handleInboundCore(env, JSON.parse(row.raw) as Inbound, c.now);
-      await markInboundProcessed(c.db, row.dedupe_id, note, claimToken);
+      if (await heartbeat.stop()) await markInboundProcessed(c.db, row.dedupe_id, note, claimToken);
     } catch (err) {
-      await recordInboundFailure(
-        c.db,
-        row.dedupe_id,
-        `sweep: ${err instanceof Error ? err.message : String(err)}`,
-        MAX_INBOUND_ATTEMPTS,
-        claimToken,
-      );
+      if (await heartbeat.stop()) {
+        await recordInboundFailure(
+          c.db,
+          row.dedupe_id,
+          `sweep: ${err instanceof Error ? err.message : String(err)}`,
+          MAX_INBOUND_ATTEMPTS,
+          claimToken,
+        );
+      }
+    } finally {
+      await heartbeat.stop();
     }
   }
 
