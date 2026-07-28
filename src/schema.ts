@@ -112,10 +112,9 @@ async function applyMigrations(db: D1Database): Promise<void> {
   for (let version = current + 1; version <= MIGRATIONS.length; version++) {
     const statements = MIGRATIONS[version - 1];
     if (!statements) continue;
-    await db.batch(statements.map((s) => db.prepare(s)));
-    await db
+    const marker = db
       .prepare(`INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc) VALUES (?, ?)`)
-      .bind(version, Date.now())
-      .run();
+      .bind(version, Date.now());
+    await db.batch([...statements.map((s) => db.prepare(s)), marker]);
   }
 }

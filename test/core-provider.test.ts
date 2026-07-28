@@ -23,6 +23,7 @@ const user: UserRow = {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe('outbound retry delivery', () => {
@@ -57,6 +58,7 @@ describe('outbound retry delivery', () => {
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
     vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
+    vi.spyOn(db, 'renewOutboundAttempt').mockResolvedValue(true);
     vi.spyOn(db, 'getSetting').mockResolvedValue('https://donna.example');
     const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
 
@@ -114,6 +116,7 @@ describe('outbound retry delivery', () => {
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
     vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
+    vi.spyOn(db, 'renewOutboundAttempt').mockResolvedValue(true);
     vi.spyOn(db, 'getSetting').mockResolvedValue('https://donna.example');
     const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
 
@@ -130,5 +133,55 @@ describe('outbound retry delivery', () => {
       3,
       undefined,
     );
+  });
+
+  it('renews a slow provider attempt so an overlapping tick cannot reclaim it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.UTC(2026, 6, 28, 14, 0));
+    const outbound: OutboundRow = {
+      id: 10,
+      at_utc: 0,
+      kind: 'nag',
+      task_id: 42,
+      channel_message_id: 'SM-old',
+      trello_card_id: null,
+      body: 'Finish the draft.',
+      status: 'failed',
+      retry_count: 2,
+    };
+    let release!: () => void;
+    const provider = new Promise<{ messageId: string }>((resolve) => {
+      release = () => resolve({ messageId: 'SM-new' });
+    });
+    const send = vi.fn().mockReturnValue(provider);
+    vi.spyOn(channel, 'getChannel').mockReturnValue({ name: 'twilio', send, parseWebhook: vi.fn() });
+    vi.spyOn(db, 'getUser').mockResolvedValue(user);
+    vi.spyOn(db, 'setSetting').mockResolvedValue();
+    vi.spyOn(db, 'ensureSession').mockResolvedValue({
+      local_date: '2026-07-28',
+      plan_state: 'confirmed',
+      prompted_at_utc: null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null,
+      weekly_sent: 0,
+    });
+    vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
+    vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
+    vi.spyOn(db, 'getSetting').mockResolvedValue(null);
+    const claim = vi.spyOn(db, 'claimOutboundRetry').mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const renew = vi.spyOn(db, 'renewOutboundAttempt').mockResolvedValue(true);
+    const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
+
+    const first = tick({ DB: {} as D1Database } as AppEnv, Date.UTC(2026, 6, 28, 14, 0));
+    await vi.advanceTimersByTimeAsync(100_001);
+    const second = tick({ DB: {} as D1Database } as AppEnv, Date.UTC(2026, 6, 28, 14, 1));
+    await vi.advanceTimersByTimeAsync(1);
+    release();
+    await Promise.all([first, second]);
+
+    expect(renew).toHaveBeenCalled();
+    expect(claim).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledOnce();
+    expect(complete).toHaveBeenCalledOnce();
   });
 });

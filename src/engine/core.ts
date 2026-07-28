@@ -32,6 +32,7 @@ import {
   recentTrelloEcho,
   recordInboundFailure,
   renewInboundClaim,
+  renewOutboundAttempt,
   setOutboundStatusByMessageId,
   setSetting,
   stuckTasks,
@@ -82,6 +83,53 @@ const SCHEDULER_LEASE_MS = 5 * 60_000;
 
 interface InboundLeaseHeartbeat {
   stop(): Promise<boolean>;
+}
+
+interface OutboundLeaseHeartbeat {
+  stop(): Promise<boolean>;
+}
+
+function startOutboundLeaseHeartbeat(
+  db: D1Database,
+  id: number,
+  claimToken: string,
+  leaseMs: number,
+): OutboundLeaseHeartbeat {
+  let stopped = false;
+  let ownershipLost = false;
+  let renewal: Promise<void> | null = null;
+  let stopPromise: Promise<boolean> | null = null;
+  const intervalMs = Math.max(1_000, Math.floor(leaseMs / 3));
+  const renew = (): void => {
+    if (stopped || ownershipLost || renewal) return;
+    const active = renewOutboundAttempt(db, id, claimToken, Date.now(), leaseMs)
+      .then((owned) => {
+        if (!owned) ownershipLost = true;
+      })
+      .catch(() => {
+        ownershipLost = true;
+      })
+      .finally(() => {
+        if (renewal === active) renewal = null;
+      });
+    renewal = active;
+  };
+  const timer = setInterval(renew, intervalMs);
+  return {
+    stop(): Promise<boolean> {
+      if (stopPromise) return stopPromise;
+      stopped = true;
+      clearInterval(timer);
+      stopPromise = (async () => {
+        if (renewal) await renewal;
+        if (ownershipLost) return false;
+        const owned = await renewOutboundAttempt(db, id, claimToken, Date.now(), leaseMs);
+        if (!owned) ownershipLost = true;
+        return owned;
+      })();
+      return stopPromise;
+    },
+  };
 }
 
 function startInboundLeaseHeartbeat(
@@ -207,6 +255,7 @@ async function dispatchOutboundAttempt(
   taskId: number | null,
   retryCount: number,
 ): Promise<void> {
+  const heartbeat = startOutboundLeaseHeartbeat(c.db, id, claimToken, SCHEDULER_LEASE_MS);
   try {
     const res = await getChannel(c.env).send(
       c.env,
@@ -214,7 +263,9 @@ async function dispatchOutboundAttempt(
       body,
       await deliverySendOpts(c.env, c.db, taskId),
     );
-    await completeOutboundAttempt(c.db, id, claimToken, res ? 'sent' : 'failed', retryCount, res?.messageId);
+    if (await heartbeat.stop()) {
+      await completeOutboundAttempt(c.db, id, claimToken, res ? 'sent' : 'failed', retryCount, res?.messageId);
+    }
   } catch (err) {
     console.error(
       JSON.stringify({
@@ -223,7 +274,9 @@ async function dispatchOutboundAttempt(
         err: err instanceof Error ? err.message : String(err),
       }),
     );
-    await completeOutboundAttempt(c.db, id, claimToken, 'failed', retryCount);
+    if (await heartbeat.stop()) await completeOutboundAttempt(c.db, id, claimToken, 'failed', retryCount);
+  } finally {
+    await heartbeat.stop();
   }
 }
 
@@ -800,11 +853,16 @@ async function syncTrelloToday(c: Ctx): Promise<void> {
   }
 }
 
-async function prepareMorningPrompt(c: Ctx): Promise<string> {
+interface PreparedMorningPrompt {
+  planBody: string;
+  stuckReviewBody: string | null;
+}
+
+async function prepareMorningPrompt(c: Ctx): Promise<PreparedMorningPrompt> {
   const stuck = await stuckTasks(c.db);
+  let stuckReviewBody: string | null = null;
   if (stuck.length > 0 && (await getSetting(c.db, 'stuck_review_date')) !== c.today) {
-    await setSetting(c.db, 'stuck_review_date', c.today);
-    await sendOwner(c, 'plan', copy.stuckReview(stuck));
+    stuckReviewBody = copy.stuckReview(stuck);
   }
   await syncTrelloToday(c);
   const open = await openTasks(c.db, c.today);
@@ -822,11 +880,16 @@ async function prepareMorningPrompt(c: Ctx): Promise<string> {
   await setSetting(c.db, 'plan_proposal', JSON.stringify(proposal));
   await saveStatusOrder(c, open);
   const map = new Map<number, string>(Object.entries(proposal).map(([k, v]) => [Number(k), v]));
-  return copy.planPrompt(open, map, c.tz);
+  return { planBody: copy.planPrompt(open, map, c.tz), stuckReviewBody };
 }
 
 async function morningPrompt(c: Ctx, session: SessionRow): Promise<void> {
-  await sendOwner(c, 'plan', await prepareMorningPrompt(c));
+  const prepared = await prepareMorningPrompt(c);
+  if (prepared.stuckReviewBody) {
+    await sendOwner(c, 'plan', prepared.stuckReviewBody);
+    await setSetting(c.db, 'stuck_review_date', c.today);
+  }
+  await sendOwner(c, 'plan', prepared.planBody);
   await claimSessionFields(
     c.db,
     c.today,
@@ -1205,7 +1268,7 @@ async function weeklyIfDue(c: Ctx, session: SessionRow): Promise<void> {
     { weekly_sent: 1 },
     { kind: 'recap', body },
     token,
-    c.now,
+    Date.now(),
     SCHEDULER_LEASE_MS,
     `session:${c.today}:weekly`,
   );
@@ -1227,20 +1290,26 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
     if (c.parts.minOfDay >= eveningMin) {
       await updateSession(c.db, c.today, { plan_state: 'no_plan' }); // day already over; stay quiet
     } else {
-      const body = await prepareMorningPrompt(c);
+      const prepared = await prepareMorningPrompt(c);
       const token = crypto.randomUUID();
       const claimed = await claimSessionOutbound(
         c.db,
         c.today,
         { plan_state: 'unplanned' },
         { plan_state: 'prompted', prompted_at_utc: c.now },
-        { kind: 'plan', body },
+        { kind: 'plan', body: prepared.planBody },
         token,
-        c.now,
+        Date.now(),
         SCHEDULER_LEASE_MS,
         `session:${c.today}:morning`,
       );
-      if (claimed) await dispatchOutboundAttempt(c, claimed.id, token, body, null, 0);
+      if (claimed) {
+        if (prepared.stuckReviewBody) {
+          await sendOwner(c, 'plan', prepared.stuckReviewBody);
+          await setSetting(c.db, 'stuck_review_date', c.today);
+        }
+        await dispatchOutboundAttempt(c, claimed.id, token, prepared.planBody, null, 0);
+      }
     }
   } else if (session.plan_state === 'prompted' && session.prompted_at_utc) {
     const elapsed = c.now - session.prompted_at_utc;
@@ -1255,7 +1324,7 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
         { nudges_sent: 2 },
         { kind: 'plan', body: copy.PLAN_NUDGE_FINAL },
         token,
-        c.now,
+        Date.now(),
         SCHEDULER_LEASE_MS,
         `session:${c.today}:nudge:2`,
       );
@@ -1269,7 +1338,7 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
         { nudges_sent: 1 },
         { kind: 'plan', body: copy.PLAN_NUDGE_1 },
         token,
-        c.now,
+        Date.now(),
         SCHEDULER_LEASE_MS,
         `session:${c.today}:nudge:1`,
       );
@@ -1310,7 +1379,7 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
         },
         { kind: t.status === 'started' ? 'checkin' : 'nag', task_id: t.id, body },
         token,
-        c.now,
+        Date.now(),
         SCHEDULER_LEASE_MS,
         `task:${t.id}:nag:${t.next_action_at_utc}`,
       );
@@ -1330,7 +1399,7 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
       openCount: open.length,
     });
     if (pulseOk && session.plan_state === 'confirmed') {
-      if (await claimSettingLease(c.db, 'scheduler:pulse', c.now, SCHEDULER_LEASE_MS)) {
+      if (await claimSettingLease(c.db, 'scheduler:pulse', Date.now(), SCHEDULER_LEASE_MS)) {
         await saveStatusOrder(c, open);
         await sendOwner(c, 'pulse', copy.pulseMsg(open, await doneTodayCount(c), c.tz));
       }
@@ -1349,7 +1418,7 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
         { recap_sent_at_utc: c.now },
         { kind: 'recap', body },
         token,
-        c.now,
+        Date.now(),
         SCHEDULER_LEASE_MS,
         `session:${c.today}:recap`,
       );
@@ -1395,9 +1464,11 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   }
 
   // Outbound retries
-  for (const row of await failedOutbound(c.db, c.now)) {
+  const outboundClaimNow = Date.now();
+  for (const row of await failedOutbound(c.db, outboundClaimNow)) {
     const token = crypto.randomUUID();
-    if (!(await claimOutboundRetry(c.db, row.id, row.retry_count, token, c.now, SCHEDULER_LEASE_MS))) continue;
+    const claimNow = Date.now();
+    if (!(await claimOutboundRetry(c.db, row.id, row.retry_count, token, claimNow, SCHEDULER_LEASE_MS))) continue;
     await dispatchOutboundAttempt(c, row.id, token, row.body, row.task_id, row.retry_count + 1);
   }
 }

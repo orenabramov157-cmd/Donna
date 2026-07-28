@@ -449,7 +449,7 @@ describe('recoverable outbound generations', () => {
     expect(claim).toEqual({ id: 81, token: 'session-worker' });
     expect(fake.batch).toHaveBeenCalledOnce();
     expect(fake.prepared[0]?.sql).toContain('UPDATE daily_sessions');
-    expect(fake.prepared[1]?.sql).toContain('INSERT OR IGNORE INTO outbound_log');
+    expect(fake.prepared[1]?.sql).toContain('INSERT INTO outbound_log');
     expect(fake.prepared[1]?.args).toEqual(
       expect.arrayContaining(['session-worker', 302_000, 'session:2026-07-28:morning']),
     );
@@ -473,7 +473,7 @@ describe('recoverable outbound generations', () => {
     expect(claim).toEqual({ id: 81, token: 'task-worker' });
     expect(fake.batch).toHaveBeenCalledOnce();
     expect(fake.prepared[0]?.sql).toContain('UPDATE tasks');
-    expect(fake.prepared[1]?.sql).toContain('INSERT OR IGNORE INTO outbound_log');
+    expect(fake.prepared[1]?.sql).toContain('INSERT INTO outbound_log');
   });
 
   it('reclaims an expired retry generation with exactly one new winner', async () => {
@@ -529,6 +529,38 @@ describe('recoverable outbound generations', () => {
     ).resolves.toBeNull();
 
     expect(fake.prepared[0]?.args).toContain(1_000);
+  });
+
+  it('rolls back logical state when the unique outbound dedupe insert conflicts', async () => {
+    let planState = 'unplanned';
+    const prepare = vi.fn((sql: string) => ({
+      sql,
+      bind: vi.fn((...args: unknown[]) => ({ sql, args })),
+    }));
+    const batch = vi.fn(async () => {
+      const before = planState;
+      planState = 'prompted';
+      planState = before;
+      throw new Error('UNIQUE constraint failed: outbound_log.dedupe_key');
+    });
+    const database = { prepare, batch } as unknown as D1Database;
+
+    await expect(
+      claimSessionOutbound(
+        database,
+        '2026-07-28',
+        { plan_state: 'unplanned' },
+        { plan_state: 'prompted', prompted_at_utc: 2_000 },
+        { kind: 'plan', body: 'Plan.' },
+        'worker',
+        2_000,
+        300_000,
+        'session:2026-07-28:morning',
+      ),
+    ).resolves.toBeNull();
+
+    expect(planState).toBe('unplanned');
+    expect(String(prepare.mock.calls[1]?.[0])).not.toContain('OR IGNORE');
   });
 });
 
@@ -616,6 +648,7 @@ describe('scheduler and outbound claims', () => {
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([]);
     vi.spyOn(db, 'updateSession').mockResolvedValue();
+    vi.spyOn(db, 'renewOutboundAttempt').mockResolvedValue(true);
     const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
     const send = vi.fn().mockRejectedValue(new Error('provider timeout'));
     vi.spyOn(channel, 'getChannel').mockReturnValue({
@@ -633,7 +666,7 @@ describe('scheduler and outbound claims', () => {
       { plan_state: 'prompted', prompted_at_utc: now },
       expect.objectContaining({ kind: 'plan', body: expect.any(String) }),
       expect.any(String),
-      now,
+      expect.any(Number),
       5 * 60_000,
       'session:2026-07-28:morning',
     );
@@ -645,6 +678,55 @@ describe('scheduler and outbound claims', () => {
       'failed',
       0,
     );
+  });
+
+  it('does not send a stuck review when another morning tick wins the session claim', async () => {
+    const database = {} as D1Database;
+    const now = Date.UTC(2026, 6, 28, 12, 0);
+    vi.spyOn(db, 'setSetting').mockResolvedValue();
+    vi.spyOn(db, 'getSetting').mockResolvedValue(null);
+    vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
+    vi.spyOn(db, 'ensureSession').mockResolvedValue({
+      local_date: '2026-07-28',
+      plan_state: 'unplanned',
+      prompted_at_utc: null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null,
+      weekly_sent: 0,
+    });
+    vi.spyOn(db, 'claimSessionOutbound').mockResolvedValue(null);
+    vi.spyOn(db, 'stuckTasks').mockResolvedValue([{
+      id: 42,
+      trello_card_id: null,
+      title: 'Blocked draft',
+      definition_of_done: null,
+      source_local_date: '2026-07-28',
+      due_at_utc: null,
+      next_action_at_utc: null,
+      status: 'stuck',
+      consecutive_deferrals: 0,
+      nags_sent_today: 0,
+      last_nag_at_utc: null,
+      blocker: 'Waiting',
+      pending_prompt: null,
+      created_by: 'owner',
+      created_at_utc: now,
+    }]);
+    vi.spyOn(db, 'openTasks').mockResolvedValue([]);
+    vi.spyOn(db, 'dueTasks').mockResolvedValue([]);
+    vi.spyOn(db, 'lastOutboundAt').mockResolvedValue(null);
+    vi.spyOn(db, 'lastInboundAt').mockResolvedValue(null);
+    vi.spyOn(db, 'recentInboundTexts').mockResolvedValue([]);
+    vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
+    vi.spyOn(db, 'failedOutbound').mockResolvedValue([]);
+    vi.spyOn(db, 'logOutbound').mockResolvedValue(88);
+    vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(true);
+    const send = vi.fn().mockResolvedValue({ messageId: 'SM-stuck' });
+    vi.spyOn(channel, 'getChannel').mockReturnValue({ name: 'test', send, parseWebhook: vi.fn() });
+
+    await tick({ DB: database } as AppEnv, now);
+
+    expect(send).not.toHaveBeenCalled();
   });
 });
 
