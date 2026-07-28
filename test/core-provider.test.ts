@@ -57,6 +57,7 @@ describe('outbound retry delivery', () => {
     });
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
+    vi.spyOn(db, 'getSetting').mockResolvedValue(null);
     vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
     vi.spyOn(db, 'renewOutboundAttempt').mockResolvedValue(true);
     vi.spyOn(db, 'getSetting').mockResolvedValue('https://donna.example');
@@ -183,5 +184,42 @@ describe('outbound retry delivery', () => {
     expect(claim).toHaveBeenCalledTimes(2);
     expect(send).toHaveBeenCalledOnce();
     expect(complete).toHaveBeenCalledOnce();
+  });
+
+  it('makes no provider call when the claimed generation is stale before dispatch', async () => {
+    const outbound: OutboundRow = {
+      id: 11,
+      at_utc: 0,
+      kind: 'nag',
+      task_id: 42,
+      channel_message_id: 'SM-old',
+      trello_card_id: null,
+      body: 'Finish the draft.',
+      status: 'failed',
+      retry_count: 2,
+    };
+    const send = vi.fn().mockResolvedValue({ messageId: 'SM-new' });
+    vi.spyOn(channel, 'getChannel').mockReturnValue({ name: 'twilio', send, parseWebhook: vi.fn() });
+    vi.spyOn(db, 'getUser').mockResolvedValue(user);
+    vi.spyOn(db, 'setSetting').mockResolvedValue();
+    vi.spyOn(db, 'ensureSession').mockResolvedValue({
+      local_date: '2026-07-28',
+      plan_state: 'confirmed',
+      prompted_at_utc: null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null,
+      weekly_sent: 0,
+    });
+    vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
+    vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
+    vi.spyOn(db, 'getSetting').mockResolvedValue(null);
+    vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
+    vi.spyOn(db, 'renewOutboundAttempt').mockResolvedValue(false);
+    const complete = vi.spyOn(db, 'completeOutboundAttempt').mockResolvedValue(false);
+
+    await tick({ DB: {} as D1Database } as AppEnv, Date.UTC(2026, 6, 28, 14, 0));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
   });
 });

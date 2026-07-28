@@ -255,6 +255,20 @@ async function dispatchOutboundAttempt(
   taskId: number | null,
   retryCount: number,
 ): Promise<void> {
+  let owned = false;
+  try {
+    owned = await renewOutboundAttempt(c.db, id, claimToken, Date.now(), SCHEDULER_LEASE_MS);
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        evt: 'outbound_preflight_failed',
+        outboundId: id,
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return;
+  }
+  if (!owned) return;
   const heartbeat = startOutboundLeaseHeartbeat(c.db, id, claimToken, SCHEDULER_LEASE_MS);
   try {
     const res = await getChannel(c.env).send(
