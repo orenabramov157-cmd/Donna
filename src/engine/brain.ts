@@ -179,12 +179,19 @@ export function validateInterpretation(rawText: string, taskCount: number, today
         break;
     }
   }
+  const seenTaskRefs = new Set<number>();
+  const acceptedActions = actions.filter((action) => {
+    if (!('task' in action)) return true;
+    if (seenTaskRefs.has(action.task)) return false;
+    seenTaskRefs.add(action.task);
+    return true;
+  });
   const reply = str(parsed.reply);
   const question = str(parsed.question);
   const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0.5;
-  if (actions.length === 0 && !reply && !question) return null;
+  if (acceptedActions.length === 0 && !reply && !question) return null;
   return {
-    actions,
+    actions: acceptedActions,
     reply: reply ? reply.slice(0, 500) : null,
     question: question ? question.slice(0, 300) : null,
     confidence,

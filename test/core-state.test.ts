@@ -2,7 +2,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AppEnv } from '../src/env';
 import type { UserRow } from '../src/db';
 import * as db from '../src/db';
-import { claimInbound, markInboundProcessed, recordInboundFailure, renewInboundClaim, upsertUser } from '../src/db';
+import {
+  claimInbound,
+  incrementSettingBelow,
+  markInboundProcessed,
+  recordInboundFailure,
+  renewInboundClaim,
+  upsertUser,
+} from '../src/db';
+import { aiBudgetOk } from '../src/parse';
 import { processInbound, runSetup, tick } from '../src/engine/core';
 
 vi.mock('../src/schema', () => ({ ensureSchema: vi.fn() }));
@@ -197,6 +205,53 @@ function leasedInboundDb(initialAttempts = 0) {
   });
   return { db: { prepare } as unknown as D1Database, prepare, state };
 }
+
+function atomicSettingDb() {
+  const state = new Map<string, number>();
+  const prepare = vi.fn((sql: string) => {
+    expect(sql).toContain('INSERT INTO settings');
+    expect(sql).toContain('ON CONFLICT');
+    expect(sql).toContain('WHERE');
+    expect(sql).toContain('RETURNING');
+    return {
+      bind: vi.fn((key: string, cap: number) => ({
+        first: async () => {
+          const used = state.get(key) ?? 0;
+          if (used >= cap) return null;
+          const next = used + 1;
+          state.set(key, next);
+          return { value: String(next) };
+        },
+      })),
+    };
+  });
+  return { db: { prepare } as unknown as D1Database, prepare, state };
+}
+
+describe('atomic settings counter', () => {
+  it('allows at most the cap when increments overlap', async () => {
+    const fake = atomicSettingDb();
+
+    const admitted = await Promise.all(
+      Array.from({ length: 8 }, () => incrementSettingBelow(fake.db, 'ai_calls_2026-07-28', 3)),
+    );
+
+    expect(admitted.filter(Boolean)).toHaveLength(3);
+    expect(fake.state.get('ai_calls_2026-07-28')).toBe(3);
+    expect(fake.prepare).toHaveBeenCalledTimes(8);
+  });
+
+  it('routes overlapping AI budget checks through the atomic counter', async () => {
+    const fake = atomicSettingDb();
+    const env = { DB: fake.db, AI_DAILY_CAP: '2' } as AppEnv;
+
+    const admitted = await Promise.all(Array.from({ length: 6 }, () => aiBudgetOk(env, '2026-07-28')));
+
+    expect(admitted.filter(Boolean)).toHaveLength(2);
+    expect(fake.state.get('ai_calls_2026-07-28')).toBe(2);
+    expect(fake.prepare).toHaveBeenCalledTimes(6);
+  });
+});
 
 describe('durable inbound failures', () => {
   it('leaves the first four sequential failures retryable and makes only the fifth terminal', async () => {

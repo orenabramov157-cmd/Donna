@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { nagPolicy, shouldPulse, shouldRenag } from '../src/engine/nag';
+import { nagPolicy, nagsSentToday, shouldPulse, shouldRenag } from '../src/engine/nag';
 import { localParts } from '../src/time';
 import type { UserRow } from '../src/db';
 
@@ -35,6 +35,27 @@ describe('shouldRenag', () => {
   it('caps at maxPerTask', () => expect(shouldRenag(std, 5, NOW - 2 * 3_600_000, NOW)).toBe(false));
   it('relentless never caps', () =>
     expect(shouldRenag(nagPolicy('relentless'), 12, NOW - 21 * 60_000, NOW)).toBe(true));
+});
+
+describe('nagsSentToday', () => {
+  it('preserves a count from the current owner-local date', () => {
+    const task = {
+      nags_sent_today: 3,
+      last_nag_at_utc: Date.UTC(2026, 6, 24, 18, 0), // 2026-07-24 11:00 PDT
+    };
+
+    expect(nagsSentToday(task, '2026-07-24', user.timezone)).toBe(3);
+  });
+
+  it('treats a persisted count from the prior owner-local date as zero', () => {
+    const task = {
+      nags_sent_today: 5,
+      // 2026-07-23 23:30 PDT, despite already being July 24 in UTC.
+      last_nag_at_utc: Date.UTC(2026, 6, 24, 6, 30),
+    };
+
+    expect(nagsSentToday(task, '2026-07-24', user.timezone)).toBe(0);
+  });
 });
 
 describe('shouldPulse', () => {

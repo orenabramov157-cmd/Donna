@@ -66,6 +66,27 @@ describe('validateInterpretation', () => {
     expect(r!.actions).toEqual([{ type: 'complete', task: 1 }]);
   });
 
+  it('keeps only the first accepted action for each task reference', () => {
+    const raw = JSON.stringify({
+      actions: [
+        { type: 'complete', task: 1 },
+        { type: 'snooze', task: 1, minutes: 30 },
+        { type: 'start', task: 2 },
+        { type: 'drop', task: 2, reason: 'duplicate stale action' },
+        { type: 'status' },
+      ],
+      reply: null,
+      question: null,
+      confidence: 0.9,
+    });
+
+    expect(validateInterpretation(raw, 2, TODAY)?.actions).toEqual([
+      { type: 'complete', task: 1 },
+      { type: 'start', task: 2 },
+      { type: 'status' },
+    ]);
+  });
+
   it('clamps past due dates to today', () => {
     const raw = JSON.stringify({
       actions: [{ type: 'add_task', title: 'x', due_date: '2026-07-20', due_time: null, remind_time: null }],

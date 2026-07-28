@@ -3,7 +3,7 @@
 // stays zero-AI so the core loop never depends on model availability.
 
 import type { AppEnv } from './env';
-import { getSetting, setSetting } from './db';
+import { incrementSettingBelow } from './db';
 import { extractDayWord, extractTrailingTime } from './time';
 
 export type NagLevel = 'gentle' | 'standard' | 'relentless';
@@ -95,8 +95,5 @@ export function parseDeterministic(raw: string): Command {
 export async function aiBudgetOk(env: AppEnv, localDate: string): Promise<boolean> {
   const cap = Number(env.AI_DAILY_CAP || '40');
   const key = `ai_calls_${localDate}`;
-  const used = Number((await getSetting(env.DB, key)) ?? '0');
-  if (used >= cap) return false;
-  await setSetting(env.DB, key, String(used + 1));
-  return true;
+  return incrementSettingBelow(env.DB, key, cap);
 }

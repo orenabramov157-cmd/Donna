@@ -1,8 +1,8 @@
 // Nag cadence + pulse policy. Pure functions over timestamps so they are
 // unit-testable without a runtime.
 
-import { inWindow, type LocalParts } from '../time';
-import type { UserRow } from '../db';
+import { inWindow, localParts, type LocalParts } from '../time';
+import type { TaskRow, UserRow } from '../db';
 
 export interface NagPolicy {
   intervalMin: number;
@@ -26,6 +26,15 @@ export function shouldRenag(policy: NagPolicy, nagsSentToday: number, lastNagAtU
   if (policy.maxPerTask !== null && nagsSentToday >= policy.maxPerTask) return false;
   if (lastNagAtUtc === null) return true;
   return nowUtc - lastNagAtUtc >= policy.intervalMin * 60_000;
+}
+
+export function nagsSentToday(
+  task: Pick<TaskRow, 'nags_sent_today' | 'last_nag_at_utc'>,
+  todayLocal: string,
+  timezone: string,
+): number {
+  if (task.last_nag_at_utc === null) return 0;
+  return localParts(task.last_nag_at_utc, timezone).localDate === todayLocal ? task.nags_sent_today : 0;
 }
 
 export function inQuietHours(user: UserRow, parts: LocalParts): boolean {

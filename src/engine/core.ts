@@ -53,7 +53,7 @@ import {
 import { parseDeterministic, type Command, type NagLevel } from '../parse';
 import { interpret, reflect, type BrainAction } from './brain';
 import { ladderStage } from './ladder';
-import { inQuietHours, nagPolicy, shouldPulse, shouldRenag } from './nag';
+import { inQuietHours, nagPolicy, nagsSentToday, shouldPulse, shouldRenag } from './nag';
 import * as copy from './copy';
 import {
   archiveCard,
@@ -1188,18 +1188,19 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
     const due = await dueTasks(c.db, c.now, c.today);
     const policy = nagPolicy(c.user.nag_level);
     for (const t of due) {
-      if (!shouldRenag(policy, t.nags_sent_today, t.last_nag_at_utc, c.now)) {
-        if (policy.maxPerTask !== null && t.nags_sent_today >= policy.maxPerTask) {
+      const sentToday = nagsSentToday(t, c.today, c.tz);
+      if (!shouldRenag(policy, sentToday, t.last_nag_at_utc, c.now)) {
+        if (policy.maxPerTask !== null && sentToday >= policy.maxPerTask) {
           await updateTask(c.db, t.id, { next_action_at_utc: null }); // capped; recap picks it up
           await appendEvent(c.db, t.id, 'nag_capped');
         }
         continue;
       }
-      const body = t.status === 'started' ? copy.startedCheckin(t) : copy.nagMsg(t, t.nags_sent_today === 0);
+      const body = t.status === 'started' ? copy.startedCheckin(t) : copy.nagMsg(t, sentToday === 0);
       await sendOwner(c, t.status === 'started' ? 'checkin' : 'nag', body, t.id);
       await updateTask(c.db, t.id, {
         status: t.status === 'started' ? 'started' : 'nagging',
-        nags_sent_today: t.nags_sent_today + 1,
+        nags_sent_today: sentToday + 1,
         last_nag_at_utc: c.now,
         next_action_at_utc: c.now + policy.intervalMin * 60_000,
       });

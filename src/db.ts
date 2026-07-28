@@ -79,6 +79,21 @@ export async function setSetting(db: D1Database, key: string, value: string): Pr
     .run();
 }
 
+export async function incrementSettingBelow(db: D1Database, key: string, cap: number): Promise<boolean> {
+  const boundedCap = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : 0;
+  if (boundedCap === 0) return false;
+  const row = await db
+    .prepare(
+      `INSERT INTO settings (key, value) VALUES (?, '1')
+       ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(settings.value AS INTEGER) + 1 AS TEXT)
+       WHERE CAST(settings.value AS INTEGER) < ?
+       RETURNING value`,
+    )
+    .bind(key, boundedCap)
+    .first<{ value: string }>();
+  return row !== null;
+}
+
 export async function delSetting(db: D1Database, key: string): Promise<void> {
   await db.prepare(`DELETE FROM settings WHERE key = ?`).bind(key).run();
 }
