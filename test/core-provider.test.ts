@@ -56,6 +56,7 @@ describe('outbound retry delivery', () => {
     });
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
+    vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
     vi.spyOn(db, 'getSetting').mockResolvedValue('https://donna.example');
     const update = vi.spyOn(db, 'setOutboundStatus').mockResolvedValue();
 
@@ -105,6 +106,7 @@ describe('outbound retry delivery', () => {
     });
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([outbound]);
+    vi.spyOn(db, 'claimOutboundRetry').mockResolvedValue(true);
     vi.spyOn(db, 'getSetting').mockResolvedValue('https://donna.example');
     const update = vi.spyOn(db, 'setOutboundStatus').mockResolvedValue();
 

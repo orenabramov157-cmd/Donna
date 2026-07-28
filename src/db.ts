@@ -172,6 +172,42 @@ export async function updateSession(db: D1Database, localDate: string, fields: P
     .run();
 }
 
+const SESSION_FIELDS = new Set<keyof SessionRow>([
+  'plan_state',
+  'prompted_at_utc',
+  'nudges_sent',
+  'recap_sent_at_utc',
+  'weekly_sent',
+]);
+
+export async function claimSessionFields(
+  db: D1Database,
+  localDate: string,
+  expected: Partial<SessionRow>,
+  fields: Partial<SessionRow>,
+): Promise<boolean> {
+  const expectedKeys = Object.keys(expected).filter((key): key is keyof SessionRow =>
+    SESSION_FIELDS.has(key as keyof SessionRow),
+  );
+  const fieldKeys = Object.keys(fields).filter((key): key is keyof SessionRow =>
+    SESSION_FIELDS.has(key as keyof SessionRow),
+  );
+  if (expectedKeys.length === 0 || fieldKeys.length === 0) return false;
+  const claimed = await db
+    .prepare(
+      `UPDATE daily_sessions SET ${fieldKeys.map((key) => `${key} = ?`).join(', ')}
+       WHERE local_date = ? AND ${expectedKeys.map((key) => `${key} IS ?`).join(' AND ')}
+       RETURNING local_date`,
+    )
+    .bind(
+      ...fieldKeys.map((key) => fields[key] ?? null),
+      localDate,
+      ...expectedKeys.map((key) => expected[key] ?? null),
+    )
+    .first<{ local_date: string }>();
+  return claimed !== null;
+}
+
 // -- tasks ------------------------------------------------------------------
 
 export interface NewTask {
@@ -229,6 +265,37 @@ export async function updateTask(db: D1Database, id: number, fields: Record<stri
     .prepare(`UPDATE tasks SET ${sets} WHERE id = ?`)
     .bind(...keys.map((k) => fields[k] ?? null), id)
     .run();
+}
+
+type TaskNagState = Pick<TaskRow, 'status' | 'next_action_at_utc' | 'nags_sent_today' | 'last_nag_at_utc'>;
+
+export async function claimTaskNag(
+  db: D1Database,
+  id: number,
+  expected: TaskNagState,
+  fields: TaskNagState,
+): Promise<boolean> {
+  const claimed = await db
+    .prepare(
+      `UPDATE tasks
+       SET status = ?, nags_sent_today = ?, last_nag_at_utc = ?, next_action_at_utc = ?
+       WHERE id = ? AND status IS ? AND nags_sent_today IS ?
+       AND last_nag_at_utc IS ? AND next_action_at_utc IS ?
+       RETURNING id`,
+    )
+    .bind(
+      fields.status,
+      fields.nags_sent_today,
+      fields.last_nag_at_utc,
+      fields.next_action_at_utc,
+      id,
+      expected.status,
+      expected.nags_sent_today,
+      expected.last_nag_at_utc,
+      expected.next_action_at_utc,
+    )
+    .first<{ id: number }>();
+  return claimed !== null;
 }
 
 export async function getTask(db: D1Database, id: number): Promise<TaskRow | null> {
@@ -592,18 +659,30 @@ export async function setOutboundStatus(
   retryCount?: number,
   channelMessageId?: string | null,
 ): Promise<void> {
-  if (retryCount === undefined && channelMessageId === undefined) {
+  if (retryCount === undefined) {
     await db.prepare(`UPDATE outbound_log SET status = ? WHERE id = ?`).bind(status, id).run();
     return;
   }
-  if (channelMessageId === undefined) {
-    await db.prepare(`UPDATE outbound_log SET status = ?, retry_count = ? WHERE id = ?`).bind(status, retryCount, id).run();
-    return;
-  }
   await db
-    .prepare(`UPDATE outbound_log SET status = ?, retry_count = ?, channel_message_id = ? WHERE id = ?`)
-    .bind(status, retryCount, channelMessageId, id)
+    .prepare(
+      `UPDATE outbound_log
+       SET status = ?, retry_count = ?, channel_message_id = COALESCE(?, channel_message_id)
+       WHERE id = ?`,
+    )
+    .bind(status, retryCount, channelMessageId ?? null, id)
     .run();
+}
+
+export async function claimOutboundRetry(db: D1Database, id: number, retryCount: number): Promise<boolean> {
+  const claimed = await db
+    .prepare(
+      `UPDATE outbound_log SET status = 'retrying'
+       WHERE id = ? AND status = 'failed' AND retry_count = ? AND retry_count < 5
+       RETURNING id`,
+    )
+    .bind(id, retryCount)
+    .first<{ id: number }>();
+  return claimed !== null;
 }
 
 export async function failedOutbound(db: D1Database, limit = 5): Promise<OutboundRow[]> {
@@ -612,6 +691,26 @@ export async function failedOutbound(db: D1Database, limit = 5): Promise<Outboun
     .bind(limit)
     .all<OutboundRow>();
   return res.results;
+}
+
+export async function claimSettingLease(
+  db: D1Database,
+  key: string,
+  nowUtc: number,
+  leaseMs: number,
+): Promise<boolean> {
+  const duration = Number.isFinite(leaseMs) ? Math.max(1, Math.floor(leaseMs)) : 1;
+  const leaseUntil = nowUtc + duration;
+  const claimed = await db
+    .prepare(
+      `INSERT INTO settings (key, value) VALUES (?, CAST(? AS TEXT))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value
+       WHERE CAST(settings.value AS INTEGER) <= ?
+       RETURNING value`,
+    )
+    .bind(key, leaseUntil, nowUtc)
+    .first<{ value: string }>();
+  return claimed !== null;
 }
 
 export async function lastOutboundAt(db: D1Database, kinds: string[]): Promise<number | null> {

@@ -6,6 +6,10 @@ import type { AppEnv } from '../env';
 import {
   appendEvent,
   claimInbound,
+  claimOutboundRetry,
+  claimSessionFields,
+  claimSettingLease,
+  claimTaskNag,
   createTask,
   dueTasks,
   ensureSession,
@@ -72,6 +76,7 @@ const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', '
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
 const MAX_INBOUND_ATTEMPTS = 5;
 const INBOUND_LEASE_MS = 5 * 60_000;
+const SCHEDULER_LEASE_MS = 5 * 60_000;
 
 interface InboundLeaseHeartbeat {
   stop(): Promise<boolean>;
@@ -181,14 +186,29 @@ async function sendOwner(
 ): Promise<void> {
   const channel = getChannel(c.env);
   const opts = await deliverySendOpts(c.env, c.db, taskId);
-  const res = await channel.send(c.env, c.user.contact, body, opts);
+  let messageId: string | null = null;
+  let sent = false;
+  try {
+    const res = await channel.send(c.env, c.user.contact, body, opts);
+    if (res) {
+      sent = true;
+      messageId = res.messageId;
+    }
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        evt: 'owner_send_failed',
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
+  }
   await logOutbound(c.db, {
     kind,
     task_id: taskId ?? null,
-    channel_message_id: res?.messageId ?? null,
+    channel_message_id: messageId,
     trello_card_id: trelloCardId ?? null,
     body,
-    status: res ? 'sent' : 'failed',
+    status: sent ? 'sent' : 'failed',
   });
 }
 
@@ -1135,6 +1155,11 @@ async function buildRecap(c: Ctx): Promise<copy.RecapStats> {
 
 async function weeklyIfDue(c: Ctx, session: SessionRow): Promise<void> {
   if (c.parts.weekday !== 'Sun' || session.weekly_sent) return;
+  if (
+    !(await claimSessionFields(c.db, c.today, { weekly_sent: 0 }, { weekly_sent: 1 }))
+  ) {
+    return;
+  }
   const events = await eventsInRange(c.db, c.now - 7 * 86_400_000, c.now + 1);
   const completed = events.filter((e) => e.kind === 'completed').length;
   const dropped = events.filter((e) => e.kind === 'dropped').length;
@@ -1150,7 +1175,6 @@ async function weeklyIfDue(c: Ctx, session: SessionRow): Promise<void> {
     }
   }
   await sendOwner(c, 'recap', copy.weeklyRecap(completed, dropped, deferred.length, worst));
-  await updateSession(c.db, c.today, { weekly_sent: 1 });
 }
 
 export async function tick(env: AppEnv, nowMs: number): Promise<void> {
@@ -1167,7 +1191,14 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   if (!quiet && session.plan_state === 'unplanned' && c.parts.minOfDay >= morningMin) {
     if (c.parts.minOfDay >= eveningMin) {
       await updateSession(c.db, c.today, { plan_state: 'no_plan' }); // day already over; stay quiet
-    } else {
+    } else if (
+      await claimSessionFields(
+        c.db,
+        c.today,
+        { plan_state: 'unplanned' },
+        { plan_state: 'prompted', prompted_at_utc: c.now },
+      )
+    ) {
       await morningPrompt(c, session);
     }
   } else if (session.plan_state === 'prompted' && session.prompted_at_utc) {
@@ -1175,11 +1206,27 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
     if (elapsed > 4 * 3_600_000 && session.nudges_sent >= 2) {
       await updateSession(c.db, c.today, { plan_state: 'no_plan' });
     } else if (elapsed > 3 * 3_600_000 && session.nudges_sent === 1 && !quiet) {
-      await sendOwner(c, 'plan', copy.PLAN_NUDGE_FINAL);
-      await updateSession(c.db, c.today, { nudges_sent: 2 });
+      if (
+        await claimSessionFields(
+          c.db,
+          c.today,
+          { plan_state: 'prompted', nudges_sent: 1 },
+          { nudges_sent: 2 },
+        )
+      ) {
+        await sendOwner(c, 'plan', copy.PLAN_NUDGE_FINAL);
+      }
     } else if (elapsed > 45 * 60_000 && session.nudges_sent === 0 && !quiet) {
-      await sendOwner(c, 'plan', copy.PLAN_NUDGE_1);
-      await updateSession(c.db, c.today, { nudges_sent: 1 });
+      if (
+        await claimSessionFields(
+          c.db,
+          c.today,
+          { plan_state: 'prompted', nudges_sent: 0 },
+          { nudges_sent: 1 },
+        )
+      ) {
+        await sendOwner(c, 'plan', copy.PLAN_NUDGE_1);
+      }
     }
   }
 
@@ -1197,13 +1244,28 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
         continue;
       }
       const body = t.status === 'started' ? copy.startedCheckin(t) : copy.nagMsg(t, sentToday === 0);
+      const nextStatus = t.status === 'started' ? 'started' : 'nagging';
+      if (
+        !(await claimTaskNag(
+          c.db,
+          t.id,
+          {
+            status: t.status,
+            next_action_at_utc: t.next_action_at_utc,
+            nags_sent_today: t.nags_sent_today,
+            last_nag_at_utc: t.last_nag_at_utc,
+          },
+          {
+            status: nextStatus,
+            nags_sent_today: sentToday + 1,
+            last_nag_at_utc: c.now,
+            next_action_at_utc: c.now + policy.intervalMin * 60_000,
+          },
+        ))
+      ) {
+        continue;
+      }
       await sendOwner(c, t.status === 'started' ? 'checkin' : 'nag', body, t.id);
-      await updateTask(c.db, t.id, {
-        status: t.status === 'started' ? 'started' : 'nagging',
-        nags_sent_today: sentToday + 1,
-        last_nag_at_utc: c.now,
-        next_action_at_utc: c.now + policy.intervalMin * 60_000,
-      });
       await appendEvent(c.db, t.id, 'reminded');
       await setSetting(c.db, 'last_nagged_task', String(t.id));
     }
@@ -1218,17 +1280,27 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
       openCount: open.length,
     });
     if (pulseOk && session.plan_state === 'confirmed') {
-      await saveStatusOrder(c, open);
-      await sendOwner(c, 'pulse', copy.pulseMsg(open, await doneTodayCount(c), c.tz));
+      if (await claimSettingLease(c.db, 'scheduler:pulse', c.now, SCHEDULER_LEASE_MS)) {
+        await saveStatusOrder(c, open);
+        await sendOwner(c, 'pulse', copy.pulseMsg(open, await doneTodayCount(c), c.tz));
+      }
     }
   }
 
   // Evening recap
   if (c.parts.minOfDay >= eveningMin && !session.recap_sent_at_utc && session.plan_state !== 'unplanned') {
-    await sendOwner(c, 'recap', copy.eveningRecap(await buildRecap(c)));
-    await updateSession(c.db, c.today, { recap_sent_at_utc: c.now });
-    await weeklyIfDue(c, session);
-    await nightlyReflection(c);
+    if (
+      await claimSessionFields(
+        c.db,
+        c.today,
+        { plan_state: session.plan_state, recap_sent_at_utc: null },
+        { recap_sent_at_utc: c.now },
+      )
+    ) {
+      await sendOwner(c, 'recap', copy.eveningRecap(await buildRecap(c)));
+      await weeklyIfDue(c, session);
+      await nightlyReflection(c);
+    }
   } else if (!quiet) {
     await maybeEarlySeed(c);
   }
@@ -1260,8 +1332,31 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
 
   // Outbound retries
   for (const row of await failedOutbound(c.db)) {
-    const res = await getChannel(env).send(env, c.user.contact, row.body, await deliverySendOpts(env, c.db, row.task_id));
-    await setOutboundStatus(c.db, row.id, res ? 'sent' : 'failed', row.retry_count + 1, res ? res.messageId : undefined);
+    if (!(await claimOutboundRetry(c.db, row.id, row.retry_count))) continue;
+    try {
+      const res = await getChannel(env).send(
+        env,
+        c.user.contact,
+        row.body,
+        await deliverySendOpts(env, c.db, row.task_id),
+      );
+      await setOutboundStatus(
+        c.db,
+        row.id,
+        res ? 'sent' : 'failed',
+        row.retry_count + 1,
+        res ? res.messageId : undefined,
+      );
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          evt: 'outbound_retry_failed',
+          outboundId: row.id,
+          err: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      await setOutboundStatus(c.db, row.id, 'failed', row.retry_count + 1, undefined);
+    }
   }
 }
 

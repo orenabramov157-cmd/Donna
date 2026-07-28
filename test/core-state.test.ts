@@ -1,13 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AppEnv } from '../src/env';
 import type { UserRow } from '../src/db';
+import * as channel from '../src/channel';
 import * as db from '../src/db';
 import {
+  claimOutboundRetry,
   claimInbound,
+  claimSessionFields,
+  claimSettingLease,
+  claimTaskNag,
   incrementSettingBelow,
   markInboundProcessed,
   recordInboundFailure,
   renewInboundClaim,
+  setOutboundStatus,
   upsertUser,
 } from '../src/db';
 import { aiBudgetOk } from '../src/parse';
@@ -227,6 +233,219 @@ function atomicSettingDb() {
   });
   return { db: { prepare } as unknown as D1Database, prepare, state };
 }
+
+function conditionalClaimsDb() {
+  const state = {
+    session: {
+      plan_state: 'unplanned',
+      prompted_at_utc: null as number | null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null as number | null,
+      weekly_sent: 0,
+    },
+    task: {
+      id: 42,
+      status: 'pending',
+      next_action_at_utc: 1_000,
+      nags_sent_today: 0,
+      last_nag_at_utc: null as number | null,
+    },
+    settings: new Map<string, number>(),
+    outbound: {
+      id: 8,
+      status: 'failed',
+      retry_count: 2,
+      task_id: 42,
+      channel_message_id: 'SM-old' as string | null,
+    },
+  };
+  const prepare = vi.fn((sql: string) => ({
+    bind: vi.fn((...args: unknown[]) => ({
+      first: async () => {
+        if (sql.includes('UPDATE daily_sessions')) {
+          const [nextState, promptedAt, localDate, expectedState] = args;
+          expect(localDate).toBe('2026-07-28');
+          if (state.session.plan_state !== expectedState) return null;
+          state.session.plan_state = String(nextState);
+          state.session.prompted_at_utc = Number(promptedAt);
+          return { local_date: localDate };
+        }
+        if (sql.includes('UPDATE tasks')) {
+          const [
+            nextStatus,
+            nextNags,
+            nextLastNag,
+            nextAction,
+            id,
+            expectedStatus,
+            expectedNags,
+            expectedLastNag,
+            expectedAction,
+          ] = args;
+          if (
+            state.task.id !== id ||
+            state.task.status !== expectedStatus ||
+            state.task.nags_sent_today !== expectedNags ||
+            state.task.last_nag_at_utc !== expectedLastNag ||
+            state.task.next_action_at_utc !== expectedAction
+          ) {
+            return null;
+          }
+          state.task.status = String(nextStatus);
+          state.task.nags_sent_today = Number(nextNags);
+          state.task.last_nag_at_utc = Number(nextLastNag);
+          state.task.next_action_at_utc = Number(nextAction);
+          return { id };
+        }
+        if (sql.includes('INSERT INTO settings')) {
+          const [key, leaseUntil, nowUtc] = args as [string, number, number];
+          const activeUntil = state.settings.get(key) ?? 0;
+          if (activeUntil > nowUtc) return null;
+          state.settings.set(key, leaseUntil);
+          return { value: String(leaseUntil) };
+        }
+        if (sql.includes("SET status = 'retrying'")) {
+          const [id, retryCount] = args;
+          if (state.outbound.id !== id || state.outbound.status !== 'failed' || state.outbound.retry_count !== retryCount) {
+            return null;
+          }
+          state.outbound.status = 'retrying';
+          return { id };
+        }
+        throw new Error(`unexpected first SQL: ${sql}`);
+      },
+      run: async () => {
+        if (!sql.includes('UPDATE outbound_log')) throw new Error(`unexpected run SQL: ${sql}`);
+        const [status, retryCount, channelMessageId, id] = args;
+        if (state.outbound.id === id) {
+          state.outbound.status = String(status);
+          state.outbound.retry_count = Number(retryCount);
+          if (channelMessageId !== null) state.outbound.channel_message_id = String(channelMessageId);
+        }
+        return { meta: { changes: state.outbound.id === id ? 1 : 0 } };
+      },
+    })),
+  }));
+  return { db: { prepare } as unknown as D1Database, prepare, state };
+}
+
+describe('scheduler and outbound claims', () => {
+  it('allows only one overlapping claimant for each scheduler and retry state', async () => {
+    const fake = conditionalClaimsDb();
+
+    const sessionClaims = await Promise.all([
+      claimSessionFields(
+        fake.db,
+        '2026-07-28',
+        { plan_state: 'unplanned' },
+        { plan_state: 'prompted', prompted_at_utc: 2_000 },
+      ),
+      claimSessionFields(
+        fake.db,
+        '2026-07-28',
+        { plan_state: 'unplanned' },
+        { plan_state: 'prompted', prompted_at_utc: 2_000 },
+      ),
+    ]);
+    const nagClaims = await Promise.all([
+      claimTaskNag(
+        fake.db,
+        42,
+        { status: 'pending', next_action_at_utc: 1_000, nags_sent_today: 0, last_nag_at_utc: null },
+        { status: 'nagging', next_action_at_utc: 62_000, nags_sent_today: 1, last_nag_at_utc: 2_000 },
+      ),
+      claimTaskNag(
+        fake.db,
+        42,
+        { status: 'pending', next_action_at_utc: 1_000, nags_sent_today: 0, last_nag_at_utc: null },
+        { status: 'nagging', next_action_at_utc: 62_000, nags_sent_today: 1, last_nag_at_utc: 2_000 },
+      ),
+    ]);
+    const leaseClaims = await Promise.all([
+      claimSettingLease(fake.db, 'scheduler:pulse', 2_000, 300_000),
+      claimSettingLease(fake.db, 'scheduler:pulse', 2_000, 300_000),
+    ]);
+    const retryClaims = await Promise.all([
+      claimOutboundRetry(fake.db, 8, 2),
+      claimOutboundRetry(fake.db, 8, 2),
+    ]);
+
+    expect(sessionClaims.filter(Boolean)).toHaveLength(1);
+    expect(nagClaims.filter(Boolean)).toHaveLength(1);
+    expect(leaseClaims.filter(Boolean)).toHaveLength(1);
+    expect(retryClaims.filter(Boolean)).toHaveLength(1);
+  });
+
+  it('stores successful retry status, count, and replacement message ID without losing task correlation', async () => {
+    const fake = conditionalClaimsDb();
+
+    await setOutboundStatus(fake.db, 8, 'sent', 3, 'SM-new');
+
+    expect(fake.state.outbound).toEqual({
+      id: 8,
+      status: 'sent',
+      retry_count: 3,
+      task_id: 42,
+      channel_message_id: 'SM-new',
+    });
+    const sql = String(fake.prepare.mock.calls[0]?.[0]);
+    expect(sql).toContain('status = ?');
+    expect(sql).toContain('retry_count = ?');
+    expect(sql).toContain('channel_message_id = COALESCE(?, channel_message_id)');
+  });
+
+  it('claims the morning session before dispatch and records a thrown provider error for retry', async () => {
+    const database = {} as D1Database;
+    const now = Date.UTC(2026, 6, 28, 12, 0);
+    const session = {
+      local_date: '2026-07-28',
+      plan_state: 'unplanned',
+      prompted_at_utc: null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null,
+      weekly_sent: 0,
+    };
+    vi.spyOn(db, 'setSetting').mockResolvedValue();
+    vi.spyOn(db, 'getSetting').mockResolvedValue(null);
+    vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
+    vi.spyOn(db, 'ensureSession').mockResolvedValue(session);
+    const claim = vi.spyOn(db, 'claimSessionFields').mockResolvedValue(true);
+    vi.spyOn(db, 'stuckTasks').mockResolvedValue([]);
+    vi.spyOn(db, 'openTasks').mockResolvedValue([]);
+    vi.spyOn(db, 'dueTasks').mockResolvedValue([]);
+    vi.spyOn(db, 'lastOutboundAt').mockResolvedValue(null);
+    vi.spyOn(db, 'lastInboundAt').mockResolvedValue(null);
+    vi.spyOn(db, 'recentInboundTexts').mockResolvedValue([]);
+    vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([]);
+    vi.spyOn(db, 'failedOutbound').mockResolvedValue([]);
+    vi.spyOn(db, 'updateSession').mockResolvedValue();
+    const logged = vi.spyOn(db, 'logOutbound').mockResolvedValue(81);
+    const send = vi.fn().mockRejectedValue(new Error('provider timeout'));
+    vi.spyOn(channel, 'getChannel').mockReturnValue({
+      name: 'test',
+      send,
+      parseWebhook: vi.fn(),
+    });
+
+    await expect(tick({ DB: database } as AppEnv, now)).resolves.toBeUndefined();
+
+    expect(claim).toHaveBeenCalledWith(
+      database,
+      '2026-07-28',
+      { plan_state: 'unplanned' },
+      { plan_state: 'prompted', prompted_at_utc: now },
+    );
+    expect(claim.mock.invocationCallOrder[0]).toBeLessThan(send.mock.invocationCallOrder[0] ?? 0);
+    expect(logged).toHaveBeenCalledWith(
+      database,
+      expect.objectContaining({
+        kind: 'plan',
+        status: 'failed',
+        channel_message_id: null,
+      }),
+    );
+  });
+});
 
 describe('atomic settings counter', () => {
   it('allows at most the cap when increments overlap', async () => {
