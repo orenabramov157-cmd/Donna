@@ -25,43 +25,114 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-function inboundFailureDb(existingError: string | null) {
-  const first = vi.fn().mockResolvedValue({ error: existingError });
-  const run = vi.fn().mockResolvedValue({ meta: { changes: 1 } });
-  const selectBind = vi.fn().mockReturnValue({ first });
-  const updateBind = vi.fn().mockReturnValue({ run });
-  const prepare = vi.fn((sql: string) => (sql.startsWith('SELECT') ? { bind: selectBind } : { bind: updateBind }));
+function inboundFailureDb(
+  initial: { attempts: number; error: string; processedAt: number | null },
+  synchronizeReads = false,
+) {
+  const state = {
+    error: JSON.stringify({ attempts: initial.attempts, error: initial.error }),
+    processedAt: initial.processedAt,
+  };
+  const waitingReads: Array<() => void> = [];
+  const waitForOverlappingRead = (): Promise<void> => {
+    if (!synchronizeReads) return Promise.resolve();
+    return new Promise((resolve) => {
+      waitingReads.push(resolve);
+      if (waitingReads.length === 2) {
+        for (const release of waitingReads) release();
+      }
+    });
+  };
+  const attempts = (): number => {
+    const parsed = JSON.parse(state.error) as { attempts: number };
+    return parsed.attempts;
+  };
+  const prepare = vi.fn((sql: string) => {
+    if (sql.startsWith('SELECT')) {
+      return {
+        bind: vi.fn(() => ({
+          first: async () => {
+            const snapshot = { error: state.error };
+            await waitForOverlappingRead();
+            return snapshot;
+          },
+        })),
+      };
+    }
+    if (sql.includes('RETURNING processed_at_utc')) {
+      return {
+        bind: vi.fn(
+          (maxAttempts: number, terminalAt: number, repeatedMax: number, error: string, _dedupeId: string) => ({
+            first: async () => {
+              expect(repeatedMax).toBe(maxAttempts);
+              if (state.processedAt !== null) return null;
+              const nextAttempts = Math.min(attempts() + 1, maxAttempts);
+              state.error = JSON.stringify({ attempts: nextAttempts, error });
+              state.processedAt = nextAttempts >= maxAttempts ? terminalAt : null;
+              return { processed_at_utc: state.processedAt };
+            },
+          }),
+        ),
+      };
+    }
+    return {
+      bind: vi.fn((processedAt: number | null, error: string, _dedupeId: string) => ({
+        run: async () => {
+          state.error = error;
+          state.processedAt = processedAt;
+          return { meta: { changes: 1 } };
+        },
+      })),
+    };
+  });
   return {
     db: { prepare } as unknown as D1Database,
-    updateBind,
+    state,
   };
 }
 
 describe('durable inbound failures', () => {
-  it('records a failed attempt without marking the inbound row processed', async () => {
-    const fake = inboundFailureDb(null);
-
-    await expect(recordInboundFailure(fake.db, 'evt-1', 'temporary outage', 5)).resolves.toBe(false);
-
-    expect(fake.updateBind).toHaveBeenCalledWith(
-      null,
-      JSON.stringify({ attempts: 1, error: 'temporary outage' }),
-      'evt-1',
-    );
-  });
-
-  it('marks the fifth failed attempt terminal while retaining the latest error', async () => {
+  it('leaves the first four sequential failures retryable and makes only the fifth terminal', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-28T18:00:00.000Z'));
-    const fake = inboundFailureDb(JSON.stringify({ attempts: 4, error: 'previous outage' }));
+    const fake = inboundFailureDb({ attempts: 0, error: '', processedAt: null });
+    const transitions: boolean[] = [];
 
-    await expect(recordInboundFailure(fake.db, 'evt-2', 'poison message', 5)).resolves.toBe(true);
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      transitions.push(await recordInboundFailure(fake.db, 'evt-1', `failure ${attempt}`, 5));
+    }
 
-    expect(fake.updateBind).toHaveBeenCalledWith(
-      Date.now(),
-      JSON.stringify({ attempts: 5, error: 'poison message' }),
-      'evt-2',
-    );
+    expect(transitions).toEqual([false, false, false, false, true]);
+    expect(fake.state).toEqual({
+      error: JSON.stringify({ attempts: 5, error: 'failure 5' }),
+      processedAt: Date.now(),
+    });
+  });
+
+  it('does not transition or overwrite a row that is already terminal', async () => {
+    const fake = inboundFailureDb({ attempts: 5, error: 'terminal failure', processedAt: 1234 });
+
+    await expect(recordInboundFailure(fake.db, 'evt-2', 'late failure', 5)).resolves.toBe(false);
+
+    expect(fake.state).toEqual({
+      error: JSON.stringify({ attempts: 5, error: 'terminal failure' }),
+      processedAt: 1234,
+    });
+  });
+
+  it('allows only one overlapping worker to make the fifth-attempt transition', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T18:00:00.000Z'));
+    const fake = inboundFailureDb({ attempts: 4, error: 'failure 4', processedAt: null }, true);
+
+    const transitions = await Promise.all([
+      recordInboundFailure(fake.db, 'evt-3', 'worker A', 5),
+      recordInboundFailure(fake.db, 'evt-3', 'worker B', 5),
+    ]);
+
+    expect(transitions.filter(Boolean)).toHaveLength(1);
+    expect(fake.state.processedAt).toBe(Date.now());
+    expect(JSON.parse(fake.state.error)).toMatchObject({ attempts: 5 });
   });
 
   it('leaves a newly received row retryable when inbound processing throws', async () => {
@@ -72,7 +143,7 @@ describe('durable inbound failures', () => {
     const markProcessed = vi.spyOn(db, 'markInboundProcessed').mockResolvedValue();
     const inbound = {
       kind: 'text' as const,
-      dedupeId: 'evt-3',
+      dedupeId: 'evt-4',
       from: configuredUser.contact,
       text: 'help',
       messageId: null,
@@ -80,7 +151,7 @@ describe('durable inbound failures', () => {
 
     await expect(processInbound({ DB: database } as AppEnv, inbound)).rejects.toThrow('temporary outage');
 
-    expect(recordFailure).toHaveBeenCalledWith(database, 'evt-3', 'temporary outage', 5);
+    expect(recordFailure).toHaveBeenCalledWith(database, 'evt-4', 'temporary outage', 5);
     expect(markProcessed).not.toHaveBeenCalled();
   });
 
@@ -96,14 +167,14 @@ describe('durable inbound failures', () => {
       recap_sent_at_utc: null,
       weekly_sent: 0,
     });
-    vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([{ dedupe_id: 'evt-4', raw: 'not-json' }]);
+    vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([{ dedupe_id: 'evt-5', raw: 'not-json' }]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([]);
     const recordFailure = vi.spyOn(db, 'recordInboundFailure').mockResolvedValue(false);
     const markProcessed = vi.spyOn(db, 'markInboundProcessed').mockResolvedValue();
 
     await tick({ DB: database } as AppEnv, Date.UTC(2026, 6, 28, 9, 0));
 
-    expect(recordFailure).toHaveBeenCalledWith(database, 'evt-4', expect.stringContaining('sweep:'), 5);
+    expect(recordFailure).toHaveBeenCalledWith(database, 'evt-5', expect.stringContaining('sweep:'), 5);
     expect(markProcessed).not.toHaveBeenCalled();
   });
 });

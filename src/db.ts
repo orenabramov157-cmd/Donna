@@ -296,29 +296,42 @@ export async function recordInboundFailure(
   error: string,
   maxAttempts: number,
 ): Promise<boolean> {
-  const row = await db
-    .prepare(`SELECT error FROM inbound_events WHERE dedupe_id = ?`)
-    .bind(dedupeId)
-    .first<{ error: string | null }>();
-  let previousAttempts = 0;
-  if (row?.error) {
-    try {
-      const previous = JSON.parse(row.error) as { attempts?: unknown };
-      if (typeof previous.attempts === 'number' && Number.isFinite(previous.attempts)) {
-        previousAttempts = Math.max(0, Math.floor(previous.attempts));
-      }
-    } catch {
-      // A legacy plain-text error has no durable attempt count.
-    }
-  }
-  const attemptLimit = Math.max(1, Math.floor(maxAttempts));
-  const attempts = Math.min(previousAttempts + 1, attemptLimit);
-  const terminal = attempts >= attemptLimit;
-  const result = await db
-    .prepare(`UPDATE inbound_events SET processed_at_utc = ?, error = ? WHERE dedupe_id = ?`)
-    .bind(terminal ? Date.now() : null, JSON.stringify({ attempts, error }), dedupeId)
-    .run();
-  return terminal && result.meta.changes > 0;
+  const attemptLimit = Number.isFinite(maxAttempts) ? Math.max(1, Math.floor(maxAttempts)) : 1;
+  const transition = await db
+    .prepare(
+      `UPDATE inbound_events
+       SET processed_at_utc = CASE
+             WHEN MAX(
+               0,
+               CASE WHEN json_valid(error)
+                 THEN COALESCE(CAST(json_extract(error, '$.attempts') AS INTEGER), 0)
+                 ELSE 0
+               END
+             ) + 1 >= ?
+             THEN ?
+             ELSE NULL
+           END,
+           error = json_object(
+             'attempts',
+             MIN(
+               MAX(
+                 0,
+                 CASE WHEN json_valid(error)
+                   THEN COALESCE(CAST(json_extract(error, '$.attempts') AS INTEGER), 0)
+                   ELSE 0
+                 END
+               ) + 1,
+               ?
+             ),
+             'error',
+             ?
+           )
+       WHERE dedupe_id = ? AND processed_at_utc IS NULL
+       RETURNING processed_at_utc`,
+    )
+    .bind(attemptLimit, Date.now(), attemptLimit, error, dedupeId)
+    .first<{ processed_at_utc: number | null }>();
+  return transition !== null && transition.processed_at_utc !== null;
 }
 
 export async function unprocessedInbound(
