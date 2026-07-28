@@ -57,4 +57,3 @@ Validation rejects impossible dates and malformed 12-hour times. AI daily usage 
 ## Testing
 
 Every behavior change begins with a failing Vitest regression test. Pure validation/authentication helpers are tested directly. D1-dependent functions use small deterministic fake bindings that exercise prepared-statement inputs and claim outcomes. Final verification runs the complete unit suite, TypeScript, `wrangler types --check`, and a Wrangler dry-run bundle.
-

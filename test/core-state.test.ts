@@ -679,6 +679,7 @@ describe('scheduler and outbound claims', () => {
   });
 
   it('claims the morning session before dispatch and records a thrown provider error for retry', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const database = {} as D1Database;
     const now = Date.UTC(2026, 6, 28, 12, 0);
     const session = {

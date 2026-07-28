@@ -73,6 +73,7 @@ describe('Trello API errors', () => {
   });
 
   it('does not create a webhook when listing existing webhooks fails', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const fetchMock = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(new Response('upstream failed', { status: 500 }))
