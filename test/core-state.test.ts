@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AppEnv } from '../src/env';
 import type { UserRow } from '../src/db';
 import * as db from '../src/db';
-import { recordInboundFailure, upsertUser } from '../src/db';
+import { claimInbound, markInboundProcessed, recordInboundFailure, upsertUser } from '../src/db';
 import { processInbound, runSetup, tick } from '../src/engine/core';
 
 vi.mock('../src/schema', () => ({ ensureSchema: vi.fn() }));
@@ -91,6 +91,93 @@ function inboundFailureDb(
   };
 }
 
+function leasedInboundDb(initialAttempts = 0) {
+  const state = {
+    attempts: initialAttempts,
+    error: '',
+    leaseToken: null as string | null,
+    leaseUntil: 0,
+    processedAt: null as number | null,
+  };
+  const prepare = vi.fn((sql: string) => {
+    if (sql.includes('RETURNING dedupe_id')) {
+      return {
+        bind: vi.fn(
+          (
+            maxAttempts: number,
+            terminalAt: number,
+            repeatedMax: number,
+            cappedMax: number,
+            token: string,
+            leaseUntil: number,
+            _dedupeId: string,
+            nowUtc: number,
+          ) => ({
+            first: async () => {
+              expect(repeatedMax).toBe(maxAttempts);
+              expect(cappedMax).toBe(maxAttempts);
+              if (state.processedAt !== null || (state.leaseToken !== null && state.leaseUntil > nowUtc)) return null;
+              if (state.attempts >= maxAttempts) {
+                state.processedAt = terminalAt;
+                state.leaseToken = null;
+                state.leaseUntil = 0;
+                return { dedupe_id: 'evt-lease', processed_at_utc: terminalAt, lease_token: null };
+              }
+              state.attempts = Math.min(state.attempts + 1, maxAttempts);
+              state.leaseToken = token;
+              state.leaseUntil = leaseUntil;
+              return { dedupe_id: 'evt-lease', processed_at_utc: null, lease_token: token };
+            },
+          }),
+        ),
+      };
+    }
+    if (sql.includes('RETURNING processed_at_utc')) {
+      return {
+        bind: vi.fn(
+          (
+            maxAttempts: number,
+            terminalAt: number,
+            repeatedMax: number,
+            error: string,
+            _dedupeId: string,
+            token: string | null,
+            repeatedToken: string | null,
+          ) => ({
+            first: async () => {
+              expect(repeatedMax).toBe(maxAttempts);
+              expect(repeatedToken).toBe(token);
+              if (state.processedAt !== null || state.leaseToken !== token) return null;
+              if (token === null) state.attempts = Math.min(state.attempts + 1, maxAttempts);
+              state.error = error;
+              state.leaseToken = null;
+              state.leaseUntil = 0;
+              state.processedAt = state.attempts >= maxAttempts ? terminalAt : null;
+              return { processed_at_utc: state.processedAt };
+            },
+          }),
+        ),
+      };
+    }
+    if (sql.includes("json_extract(error, '$.leaseToken') = ?")) {
+      return {
+        bind: vi.fn((processedAt: number, error: string | null, _dedupeId: string, token: string) => ({
+          run: async () => {
+            if (state.processedAt !== null || state.leaseToken !== token) return { meta: { changes: 0 } };
+            state.processedAt = processedAt;
+            state.error = error ?? '';
+            state.leaseToken = null;
+            state.leaseUntil = 0;
+            return { meta: { changes: 1 } };
+          },
+        })),
+      };
+    }
+    throw new Error(`unexpected SQL: ${sql}`);
+  });
+  return { db: { prepare } as unknown as D1Database, prepare, state };
+}
+
 describe('durable inbound failures', () => {
   it('leaves the first four sequential failures retryable and makes only the fifth terminal', async () => {
     vi.useFakeTimers();
@@ -135,9 +222,76 @@ describe('durable inbound failures', () => {
     expect(JSON.parse(fake.state.error)).toMatchObject({ attempts: 5 });
   });
 
+  it('grants one active lease and permits reclaim only after it expires', async () => {
+    const fake = leasedInboundDb();
+
+    const overlapping = await Promise.all([
+      claimInbound(fake.db, 'evt-lease', 'worker-A', 1_000, 100, 5),
+      claimInbound(fake.db, 'evt-lease', 'worker-B', 1_000, 100, 5),
+    ]);
+
+    expect(overlapping.filter(Boolean)).toHaveLength(1);
+    expect(await claimInbound(fake.db, 'evt-lease', 'worker-C', 1_099, 100, 5)).toBe(false);
+    expect(await claimInbound(fake.db, 'evt-lease', 'worker-C', 1_100, 100, 5)).toBe(true);
+    expect(fake.state).toMatchObject({ attempts: 2, leaseToken: 'worker-C', leaseUntil: 1_200, processedAt: null });
+    const claimSql = String(fake.prepare.mock.calls[0]?.[0]);
+    expect(claimSql).toContain('processed_at_utc IS NULL');
+    expect(claimSql).toContain("json_extract(error, '$.leaseUntil')");
+    expect(claimSql).toContain('<= ?');
+    expect(claimSql).toContain('RETURNING dedupe_id');
+  });
+
+  it('allows only the current lease owner to mark a successful row processed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T18:00:00.000Z'));
+    const fake = leasedInboundDb();
+    await claimInbound(fake.db, 'evt-lease', 'worker-A', 1_000, 100, 5);
+    await claimInbound(fake.db, 'evt-lease', 'worker-B', 1_100, 100, 5);
+
+    await markInboundProcessed(fake.db, 'evt-lease', undefined, 'worker-A');
+    expect(fake.state.processedAt).toBeNull();
+
+    await markInboundProcessed(fake.db, 'evt-lease', undefined, 'worker-B');
+    expect(fake.state.processedAt).toBe(Date.now());
+  });
+
+  it('releases failed leases for retry and terminalizes exactly the fifth claimed failure', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-28T18:00:00.000Z'));
+    const fake = leasedInboundDb();
+    const transitions: boolean[] = [];
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      const token = `worker-${attempt}`;
+      expect(await claimInbound(fake.db, 'evt-lease', token, attempt * 1_000, 100, 5)).toBe(true);
+      transitions.push(await recordInboundFailure(fake.db, 'evt-lease', `failure ${attempt}`, 5, token));
+    }
+
+    expect(transitions).toEqual([false, false, false, false, true]);
+    expect(fake.state).toMatchObject({
+      attempts: 5,
+      error: 'failure 5',
+      leaseToken: null,
+      processedAt: Date.now(),
+    });
+    expect(await claimInbound(fake.db, 'evt-lease', 'worker-6', 6_000, 100, 5)).toBe(false);
+  });
+
+  it('terminalizes an expired fifth lease without executing a sixth attempt', async () => {
+    const fake = leasedInboundDb(4);
+
+    expect(await claimInbound(fake.db, 'evt-lease', 'worker-5', 5_000, 100, 5)).toBe(true);
+    expect(fake.state).toMatchObject({ attempts: 5, leaseToken: 'worker-5', processedAt: null });
+
+    expect(await claimInbound(fake.db, 'evt-lease', 'worker-6', 5_100, 100, 5)).toBe(false);
+    expect(fake.state).toMatchObject({ attempts: 5, leaseToken: null, processedAt: 5_100 });
+  });
+
   it('leaves a newly received row retryable when inbound processing throws', async () => {
     const database = {} as D1Database;
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000004');
     vi.spyOn(db, 'tryInsertInbound').mockResolvedValue(true);
+    const claim = vi.spyOn(db, 'claimInbound').mockResolvedValue(true);
     vi.spyOn(db, 'getUser').mockRejectedValue(new Error('temporary outage'));
     const recordFailure = vi.spyOn(db, 'recordInboundFailure').mockResolvedValue(false);
     const markProcessed = vi.spyOn(db, 'markInboundProcessed').mockResolvedValue();
@@ -151,12 +305,27 @@ describe('durable inbound failures', () => {
 
     await expect(processInbound({ DB: database } as AppEnv, inbound)).rejects.toThrow('temporary outage');
 
-    expect(recordFailure).toHaveBeenCalledWith(database, 'evt-4', 'temporary outage', 5);
+    expect(claim).toHaveBeenCalledWith(
+      database,
+      'evt-4',
+      '00000000-0000-4000-8000-000000000004',
+      expect.any(Number),
+      5 * 60_000,
+      5,
+    );
+    expect(recordFailure).toHaveBeenCalledWith(
+      database,
+      'evt-4',
+      'temporary outage',
+      5,
+      '00000000-0000-4000-8000-000000000004',
+    );
     expect(markProcessed).not.toHaveBeenCalled();
   });
 
   it('records sweep exceptions without terminally processing retriable rows', async () => {
     const database = {} as D1Database;
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000001');
     vi.spyOn(db, 'setSetting').mockResolvedValue();
     vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
     vi.spyOn(db, 'ensureSession').mockResolvedValue({
@@ -169,12 +338,52 @@ describe('durable inbound failures', () => {
     });
     vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([{ dedupe_id: 'evt-5', raw: 'not-json' }]);
     vi.spyOn(db, 'failedOutbound').mockResolvedValue([]);
+    const claim = vi.spyOn(db, 'claimInbound').mockResolvedValue(true);
     const recordFailure = vi.spyOn(db, 'recordInboundFailure').mockResolvedValue(false);
     const markProcessed = vi.spyOn(db, 'markInboundProcessed').mockResolvedValue();
 
     await tick({ DB: database } as AppEnv, Date.UTC(2026, 6, 28, 9, 0));
 
-    expect(recordFailure).toHaveBeenCalledWith(database, 'evt-5', expect.stringContaining('sweep:'), 5);
+    expect(claim).toHaveBeenCalledWith(
+      database,
+      'evt-5',
+      '00000000-0000-4000-8000-000000000001',
+      Date.UTC(2026, 6, 28, 9, 0),
+      5 * 60_000,
+      5,
+    );
+    expect(recordFailure).toHaveBeenCalledWith(
+      database,
+      'evt-5',
+      expect.stringContaining('sweep:'),
+      5,
+      '00000000-0000-4000-8000-000000000001',
+    );
+    expect(markProcessed).not.toHaveBeenCalled();
+  });
+
+  it('does not execute or finalize a sweep row when another worker owns the lease', async () => {
+    const database = {} as D1Database;
+    vi.spyOn(db, 'setSetting').mockResolvedValue();
+    vi.spyOn(db, 'getUser').mockResolvedValue({ id: 1, ...configuredUser });
+    vi.spyOn(db, 'ensureSession').mockResolvedValue({
+      local_date: '2026-07-28',
+      plan_state: 'confirmed',
+      prompted_at_utc: null,
+      nudges_sent: 0,
+      recap_sent_at_utc: null,
+      weekly_sent: 0,
+    });
+    vi.spyOn(db, 'unprocessedInbound').mockResolvedValue([{ dedupe_id: 'evt-owned', raw: 'not-json' }]);
+    vi.spyOn(db, 'failedOutbound').mockResolvedValue([]);
+    const claim = vi.spyOn(db, 'claimInbound').mockResolvedValue(false);
+    const recordFailure = vi.spyOn(db, 'recordInboundFailure').mockResolvedValue(false);
+    const markProcessed = vi.spyOn(db, 'markInboundProcessed').mockResolvedValue();
+
+    await tick({ DB: database } as AppEnv, Date.UTC(2026, 6, 28, 9, 0));
+
+    expect(claim).toHaveBeenCalledOnce();
+    expect(recordFailure).not.toHaveBeenCalled();
     expect(markProcessed).not.toHaveBeenCalled();
   });
 });

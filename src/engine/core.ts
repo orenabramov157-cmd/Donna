@@ -5,6 +5,7 @@
 import type { AppEnv } from '../env';
 import {
   appendEvent,
+  claimInbound,
   createTask,
   dueTasks,
   ensureSession,
@@ -69,6 +70,7 @@ import { getChannel, type Inbound, type SendOpts } from '../channel';
 const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'chat', 'misc'];
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
 const MAX_INBOUND_ATTEMPTS = 5;
+const INBOUND_LEASE_MS = 5 * 60_000;
 
 interface Ctx {
   env: AppEnv;
@@ -943,15 +945,19 @@ export async function processInbound(env: AppEnv, inbound: Inbound): Promise<voi
   await ensureSchema(env.DB);
   const fresh = await tryInsertInbound(env.DB, inbound.dedupeId, JSON.stringify(inbound));
   if (!fresh) return;
+  const now = Date.now();
+  const claimToken = crypto.randomUUID();
+  if (!(await claimInbound(env.DB, inbound.dedupeId, claimToken, now, INBOUND_LEASE_MS, MAX_INBOUND_ATTEMPTS))) return;
   try {
-    const note = await handleInboundCore(env, inbound, Date.now());
-    await markInboundProcessed(env.DB, inbound.dedupeId, note);
+    const note = await handleInboundCore(env, inbound, now);
+    await markInboundProcessed(env.DB, inbound.dedupeId, note, claimToken);
   } catch (err) {
     await recordInboundFailure(
       env.DB,
       inbound.dedupeId,
       err instanceof Error ? err.message : String(err),
       MAX_INBOUND_ATTEMPTS,
+      claimToken,
     );
     throw err;
   }
@@ -1156,15 +1162,18 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   // Durable-inbox sweep: rows the worker crashed on before marking processed
   const stale = await unprocessedInbound(c.db, c.now - 90_000);
   for (const row of stale) {
+    const claimToken = crypto.randomUUID();
+    if (!(await claimInbound(c.db, row.dedupe_id, claimToken, c.now, INBOUND_LEASE_MS, MAX_INBOUND_ATTEMPTS))) continue;
     try {
       const note = await handleInboundCore(env, JSON.parse(row.raw) as Inbound, c.now);
-      await markInboundProcessed(c.db, row.dedupe_id, note);
+      await markInboundProcessed(c.db, row.dedupe_id, note, claimToken);
     } catch (err) {
       await recordInboundFailure(
         c.db,
         row.dedupe_id,
         `sweep: ${err instanceof Error ? err.message : String(err)}`,
         MAX_INBOUND_ATTEMPTS,
+        claimToken,
       );
     }
   }

@@ -283,11 +283,108 @@ export async function tryInsertInbound(db: D1Database, dedupeId: string, raw: st
   return res.meta.changes > 0;
 }
 
-export async function markInboundProcessed(db: D1Database, dedupeId: string, error?: string): Promise<void> {
+export async function markInboundProcessed(
+  db: D1Database,
+  dedupeId: string,
+  error?: string,
+  claimToken?: string,
+): Promise<void> {
+  if (claimToken !== undefined) {
+    await db
+      .prepare(
+        `UPDATE inbound_events SET processed_at_utc = ?, error = ?
+         WHERE dedupe_id = ? AND processed_at_utc IS NULL
+         AND json_valid(error) AND json_extract(error, '$.leaseToken') = ?`,
+      )
+      .bind(Date.now(), error ?? null, dedupeId, claimToken)
+      .run();
+    return;
+  }
   await db
     .prepare(`UPDATE inbound_events SET processed_at_utc = ?, error = ? WHERE dedupe_id = ?`)
     .bind(Date.now(), error ?? null, dedupeId)
     .run();
+}
+
+export async function claimInbound(
+  db: D1Database,
+  dedupeId: string,
+  claimToken: string,
+  nowUtc: number,
+  leaseMs: number,
+  maxAttempts: number,
+): Promise<boolean> {
+  const leaseDuration = Number.isFinite(leaseMs) ? Math.max(1, Math.floor(leaseMs)) : 1;
+  const attemptLimit = Number.isFinite(maxAttempts) ? Math.max(1, Math.floor(maxAttempts)) : 1;
+  const claimed = await db
+    .prepare(
+      `UPDATE inbound_events
+       SET processed_at_utc = CASE
+             WHEN MAX(
+               0,
+               CASE WHEN json_valid(error)
+                 THEN COALESCE(CAST(json_extract(error, '$.attempts') AS INTEGER), 0)
+                 ELSE 0
+               END
+             ) >= ?
+             THEN ?
+             ELSE NULL
+           END,
+           error = CASE
+             WHEN MAX(
+               0,
+               CASE WHEN json_valid(error)
+                 THEN COALESCE(CAST(json_extract(error, '$.attempts') AS INTEGER), 0)
+                 ELSE 0
+               END
+             ) >= ?
+             THEN json_object(
+               'attempts',
+               MAX(0, CAST(json_extract(error, '$.attempts') AS INTEGER)),
+               'error',
+               json_extract(error, '$.error')
+             )
+             ELSE json_object(
+               'attempts',
+               MIN(
+                 MAX(
+                   0,
+                   CASE WHEN json_valid(error)
+                     THEN COALESCE(CAST(json_extract(error, '$.attempts') AS INTEGER), 0)
+                     ELSE 0
+                   END
+                 ) + 1,
+                 ?
+               ),
+               'error',
+               CASE WHEN json_valid(error) THEN json_extract(error, '$.error') ELSE error END,
+               'leaseToken',
+               ?,
+               'leaseUntil',
+               ?
+             )
+           END
+       WHERE dedupe_id = ? AND processed_at_utc IS NULL
+       AND (
+         NOT json_valid(error)
+         OR json_extract(error, '$.leaseToken') IS NULL
+         OR COALESCE(CAST(json_extract(error, '$.leaseUntil') AS INTEGER), 0) <= ?
+       )
+       RETURNING dedupe_id, processed_at_utc,
+         CASE WHEN json_valid(error) THEN json_extract(error, '$.leaseToken') ELSE NULL END AS lease_token`,
+    )
+    .bind(
+      attemptLimit,
+      nowUtc,
+      attemptLimit,
+      attemptLimit,
+      claimToken,
+      nowUtc + leaseDuration,
+      dedupeId,
+      nowUtc,
+    )
+    .first<{ dedupe_id: string; processed_at_utc: number | null; lease_token: string | null }>();
+  return claimed !== null && claimed.processed_at_utc === null && claimed.lease_token === claimToken;
 }
 
 export async function recordInboundFailure(
@@ -295,8 +392,48 @@ export async function recordInboundFailure(
   dedupeId: string,
   error: string,
   maxAttempts: number,
+  claimToken: string | null = null,
 ): Promise<boolean> {
   const attemptLimit = Number.isFinite(maxAttempts) ? Math.max(1, Math.floor(maxAttempts)) : 1;
+  if (claimToken !== null) {
+    const transition = await db
+      .prepare(
+        `UPDATE inbound_events
+         SET processed_at_utc = CASE
+               WHEN MAX(
+                 0,
+                 CASE WHEN json_valid(error)
+                   THEN COALESCE(CAST(json_extract(error, '$.attempts') AS INTEGER), 0)
+                   ELSE 0
+                 END
+               ) >= ?
+               THEN ?
+               ELSE NULL
+             END,
+             error = json_object(
+               'attempts',
+               MIN(
+                 MAX(
+                   0,
+                   CASE WHEN json_valid(error)
+                     THEN COALESCE(CAST(json_extract(error, '$.attempts') AS INTEGER), 0)
+                     ELSE 0
+                   END
+                 ),
+                 ?
+               ),
+               'error',
+               ?
+             )
+         WHERE dedupe_id = ? AND processed_at_utc IS NULL
+         AND ? IS NOT NULL
+         AND json_valid(error) AND json_extract(error, '$.leaseToken') = ?
+         RETURNING processed_at_utc`,
+      )
+      .bind(attemptLimit, Date.now(), attemptLimit, error, dedupeId, claimToken, claimToken)
+      .first<{ processed_at_utc: number | null }>();
+    return transition !== null && transition.processed_at_utc !== null;
+  }
   const transition = await db
     .prepare(
       `UPDATE inbound_events
@@ -327,9 +464,22 @@ export async function recordInboundFailure(
              ?
            )
        WHERE dedupe_id = ? AND processed_at_utc IS NULL
+       AND (
+         (
+           ? IS NULL
+           AND (
+             NOT json_valid(error)
+             OR json_extract(error, '$.leaseToken') IS NULL
+           )
+         )
+         OR (
+           json_valid(error)
+           AND json_extract(error, '$.leaseToken') = ?
+         )
+       )
        RETURNING processed_at_utc`,
     )
-    .bind(attemptLimit, Date.now(), attemptLimit, error, dedupeId)
+    .bind(attemptLimit, Date.now(), attemptLimit, error, dedupeId, claimToken, claimToken)
     .first<{ processed_at_utc: number | null }>();
   return transition !== null && transition.processed_at_utc !== null;
 }
