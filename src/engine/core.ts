@@ -1647,7 +1647,7 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
         note:
           today && done
             ? `"${today.name}" and "${done.name}" resolved`
-            : `board needs lists named "${env.TRELLO_TODAY_LIST || 'Today'}" and "${env.TRELLO_DONE_LIST || 'Done'}"`,
+            : `board needs lists named "${env.TRELLO_TODAY_LIST || 'Today'}" and "${env.TRELLO_DONE_LIST || 'Done'}" — actual lists on this board: ${lists.map((l) => `"${l.name}"`).join(', ') || '(none)'}`,
       });
       if (env.WEBHOOK_TOKEN && signingSecretReady) {
         const cb = `${origin}/webhook/trello/${env.WEBHOOK_TOKEN}`;
