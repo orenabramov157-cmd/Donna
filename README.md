@@ -10,6 +10,8 @@ A single-user accountability drill sergeant that lives in your **iMessage**. It 
 
 Then open **[HANDOFF.md](HANDOFF.md)** and follow it top to bottom (≈25 minutes, browser only, no terminal). If you have an AI assistant — ChatGPT, Codex, Claude, anything — open HANDOFF.md in the chat and ask it to walk you through.
 
+**Developers:** `./scripts/smoke-local.sh` live-fires the whole loop locally in ~30s (Miniflare + dummy secrets — webhook ingest, dedupe, auth rejection, cron retry sweep) and asserts the resulting database state. Run it before trusting any change.
+
 ## What it does
 
 - 🌅 **Morning plan** — pulls your Trello "Today" list, proposes times, locks the day on your "ok"
