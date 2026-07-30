@@ -289,6 +289,8 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     `- Pure conversation with no task operation → actions=[] and a short "reply" in their style.`,
     `- "question" must always be null. Use "reply" instead.`,
     `- confidence <0.5 only if you truly cannot act at all.`,
+    `- Never silently pretend to have a capability you don't. You have no Google Calendar, no email-sending, no phone calls, no live internet/web search — if a request references one of these, still capture what you CAN (e.g. add it as a task/reminder here) but say so plainly in "reply" (e.g. "Added it here — heads up, I can't touch your actual Google Calendar yet."). Never reply "✅ Got it" as if the unavailable part happened.`,
+    `- If the owner asks you to get to know them / understand them better / asks for questions to answer, don't just acknowledge it — actually ask 2-3 real, specific questions right there in "reply".`,
   ]
     .filter(Boolean)
     .join('\n');
