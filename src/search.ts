@@ -25,16 +25,37 @@ export interface WebSearchResponse {
 
 export async function webSearch(env: AppEnv, query: string, maxResults = 5): Promise<WebSearchResponse | null> {
   if (!env.TAVILY_API_KEY) return null;
-  const res = await fetch(SEARCH_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${env.TAVILY_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      query,
-      max_results: Math.max(1, Math.min(maxResults, 10)),
-      include_answer: 'basic',
-      search_depth: 'basic',
-    }),
-  });
+  // Without a timeout, a slow/hanging upstream response blocks the whole
+  // inbound message indefinitely (no error to catch, nothing to retry into —
+  // it just sits claimed forever). 12s is generous for a search API but
+  // still leaves headroom for the two AI calls in the same request.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+  let res: Response;
+  try {
+    res = await fetch(SEARCH_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.TAVILY_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        max_results: Math.max(1, Math.min(maxResults, 10)),
+        include_answer: 'basic',
+        search_depth: 'basic',
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        evt: 'tavily_search_error',
+        aborted: err instanceof Error && err.name === 'AbortError',
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
   if (!res.ok) {
     const detail = (await res.text()).slice(0, 300);
     console.error(JSON.stringify({ evt: 'tavily_search_failed', status: res.status, detail }));
