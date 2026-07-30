@@ -200,7 +200,7 @@ export function validateInterpretation(rawText: string, taskCount: number, today
 
 // Workers AI models are not consistent about output shape: some return
 // { response }, some { result: { response } }, some OpenAI-style choices.
-function extractModelText(out: unknown): string | null {
+export function extractModelText(out: unknown): string | null {
   if (!out || typeof out !== 'object') return typeof out === 'string' && out.length > 0 ? out : null;
   const o = out as Record<string, unknown>;
   if (typeof o.response === 'string' && o.response.length > 0) return o.response;

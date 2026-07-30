@@ -57,8 +57,8 @@ import {
   utcForLocalDateTime,
   type LocalParts,
 } from '../time';
-import { parseDeterministic, type Command, type NagLevel } from '../parse';
-import { interpret, reflect, type BrainAction } from './brain';
+import { aiBudgetOk, parseDeterministic, type Command, type NagLevel } from '../parse';
+import { extractModelText, interpret, reflect, type BrainAction } from './brain';
 import { ladderStage } from './ladder';
 import { inQuietHours, nagPolicy, nagsSentToday, shouldPulse, shouldRenag } from './nag';
 import * as copy from './copy';
@@ -74,6 +74,7 @@ import {
   trelloConfigured,
 } from '../trello';
 import { encodeDeliveryAttemptMetadata, getChannel, type Inbound, type SendOpts } from '../channel';
+import { gmailConfigured, listRecentMessages } from '../gmail';
 
 const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'chat', 'misc'];
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
@@ -853,6 +854,80 @@ async function nightlyReflection(c: Ctx): Promise<void> {
   }
 }
 
+// -- Gmail digest (read-only; opt-in via GMAIL_* secrets) -------------------
+//
+// Two entry points share one builder: a scheduled digest at owner-configured
+// times (GMAIL_DIGEST_TIMES, "HH:MM,HH:MM"), and an on-demand "check email"
+// text command. Read-only scope only — nothing here ever sends or modifies
+// mail. Silently no-ops whenever Gmail isn't configured, so this is inert on
+// any instance that hasn't wired the three GMAIL_* secrets.
+
+async function buildGmailDigest(c: Ctx, sinceHours: number): Promise<string | null> {
+  const messages = await listRecentMessages(c.env, sinceHours);
+  if (messages === null) return null; // token/API failure — caller decides how to report
+  if (messages.length === 0) return `📬 Inbox check — nothing new in the last ${sinceHours}h.`;
+  if (!(await aiBudgetOk(c.env, c.today))) {
+    // Budget exhausted: still useful without AI — a bare count + senders.
+    const senders = [...new Set(messages.map((m) => m.from.split('<')[0]?.trim() || m.from))].slice(0, 8);
+    return `📬 ${messages.length} new email${messages.length === 1 ? '' : 's'} (last ${sinceHours}h) from: ${senders.join(', ')}.`;
+  }
+  const list = messages
+    .map((m, i) => `${i + 1}. From: ${m.from} | Subject: ${m.subject} | Preview: ${m.snippet}`)
+    .join('\n');
+  const system = [
+    `You summarize a Gmail inbox into a short iMessage digest for the account owner. Voice: brief, direct, scannable — this is a text message, not a report.`,
+    `Group by who it's from where obvious. Call out anything that reads like it needs a reply or action. Skip pure marketing/newsletter noise in one line ("+ a few newsletters") rather than listing each. Under 500 characters total. No preamble, no "Here's your digest" — just the content.`,
+    `Emails (${messages.length}):\n${list}`,
+  ].join('\n');
+  try {
+    const out: unknown = await c.env.AI.run(
+      (c.env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast') as Parameters<Ai['run']>[0],
+      { messages: [{ role: 'system', content: system }, { role: 'user', content: 'Summarize.' }], max_tokens: 400 },
+    );
+    const text = extractModelText(out);
+    return text ? `📬 ${text.trim().slice(0, 900)}` : `📬 ${messages.length} new emails (last ${sinceHours}h) — summary unavailable, try "check email" again.`;
+  } catch (err) {
+    console.error(JSON.stringify({ evt: 'gmail_digest_summarize_failed', err: err instanceof Error ? err.message : String(err) }));
+    return `📬 ${messages.length} new emails (last ${sinceHours}h) — summary unavailable, try "check email" again.`;
+  }
+}
+
+async function sendGmailDigest(c: Ctx, sinceHours: number): Promise<void> {
+  if (!gmailConfigured(c.env)) {
+    await sendOwner(c, 'misc', `Gmail isn't connected yet — ask whoever set up this Donna to wire it.`);
+    return;
+  }
+  const digest = await buildGmailDigest(c, sinceHours);
+  await sendOwner(c, 'misc', digest ?? `📬 Couldn't reach Gmail just now — check the connection and try again.`);
+}
+
+// Parses "HH:MM,HH:MM" from the GMAIL_DIGEST_TIMES var. Malformed or missing
+// entries are dropped rather than crashing the cron tick.
+export function digestTimesMin(env: AppEnv): number[] {
+  const raw = env.GMAIL_DIGEST_TIMES ?? '';
+  const out: number[] = [];
+  for (const part of raw.split(',')) {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(part.trim());
+    if (!m) continue;
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (hh < 24 && mm < 60) out.push(hh * 60 + mm);
+  }
+  return out;
+}
+
+async function maybeSendScheduledDigest(c: Ctx): Promise<void> {
+  if (!gmailConfigured(c.env)) return;
+  const times = digestTimesMin(c.env);
+  if (times.length === 0) return;
+  const slot = times.find((t) => c.parts.minOfDay >= t && c.parts.minOfDay < t + 1);
+  if (slot === undefined) return;
+  const key = `gmail_digest_sent_${c.today}_${slot}`;
+  if (await getSetting(c.db, key)) return; // already sent this slot today
+  await setSetting(c.db, key, '1'); // set before send: a slow/failed send should not retry-storm every tick
+  await sendGmailDigest(c, 8); // last 8h covers typical gaps between 2-3 daily slots
+}
+
 // -- morning plan -----------------------------------------------------------
 
 async function syncTrelloToday(c: Ctx): Promise<void> {
@@ -1061,6 +1136,9 @@ async function routeText(c: Ctx, text: string): Promise<void> {
       await sendOwner(c, 'receipt', body);
       return;
     }
+    case 'gmaildigest':
+      await sendGmailDigest(c, 24);
+      return;
     case 'add':
       await addTask(c, effective.title, effective.time, 'daysAhead' in effective ? (effective.daysAhead ?? 0) : 0);
       return;
@@ -1324,6 +1402,8 @@ export async function tick(env: AppEnv, nowMs: number): Promise<void> {
   const quiet = inQuietHours(c.user, c.parts);
   const morningMin = hhmmToMin(c.user.morning_time);
   const eveningMin = hhmmToMin(c.user.evening_time);
+
+  if (!quiet) await maybeSendScheduledDigest(c);
 
   // Morning planning
   if (!quiet && session.plan_state === 'unplanned' && c.parts.minOfDay >= morningMin) {
@@ -1665,6 +1745,23 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
     }
   } else {
     steps.push({ name: 'Trello (optional)', ok: true, note: 'not configured — bot runs standalone' });
+  }
+
+  if (gmailConfigured(env)) {
+    const testMessages = await listRecentMessages(env, 1, 1);
+    const scheduled = digestTimesMin(env);
+    steps.push({
+      name: 'Gmail digest',
+      ok: testMessages !== null,
+      note:
+        testMessages === null
+          ? 'credentials present but the token exchange failed — check GMAIL_REFRESH_TOKEN'
+          : scheduled.length > 0
+            ? `connected, scheduled at ${env.GMAIL_DIGEST_TIMES}`
+            : 'connected, on-demand only — text "check email" anytime (set GMAIL_DIGEST_TIMES for a schedule)',
+    });
+  } else {
+    steps.push({ name: 'Gmail digest (optional)', ok: true, note: 'not configured — bot runs standalone' });
   }
 
   const coreReady = Boolean(profileReady && env.LOOP_AUTH_KEY && env.LOOP_WEBHOOK_AUTH && env.WEBHOOK_TOKEN);

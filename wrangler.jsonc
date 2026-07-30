@@ -41,6 +41,10 @@
 		"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
 		"AI_DAILY_CAP": "40",
 		"TRELLO_TODAY_LIST": "Today",
-		"TRELLO_DONE_LIST": "Done"
+		"TRELLO_DONE_LIST": "Done",
+		// Comma-separated "HH:MM" local times for the Gmail digest. Empty =
+		// disabled (digest stays available on-demand via "check email" once
+		// the GMAIL_* secrets are set, but never fires on a schedule).
+		"GMAIL_DIGEST_TIMES": ""
 	}
 }

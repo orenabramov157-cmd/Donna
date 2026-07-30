@@ -19,7 +19,7 @@ export const HELP = [
   'Commands (always work):',
   'done / done 2 · start · snooze 30 · tomorrow · not done · blocked <why>',
   'drop 2 <reason> · add: <task> [time] · plan · status · undo · nag gentle|standard|relentless · help',
-  'be a <vibe> (locks how I treat you) · persona off · learn now',
+  'be a <vibe> (locks how I treat you) · persona off · learn now · check email',
   'Or just talk to me — I usually get it.',
 ].join('\n');
 

@@ -25,6 +25,7 @@ export type Command =
   | { op: 'settings' }
   | { op: 'resetmemory' }
   | { op: 'resync' }
+  | { op: 'gmaildigest' }
   | { op: 'persona'; directive: string }
   | { op: 'personaclear' }
   | { op: 'naglevel'; level: NagLevel }
@@ -71,6 +72,7 @@ export function parseDeterministic(raw: string): Command {
   if (/^settings[?.!]*$/i.test(t)) return { op: 'settings' };
   if (/^reset\s+(?:memory|brain)[.!]*$/i.test(t)) return { op: 'resetmemory' };
   if (/^(?:learn now|re-?learn( me)?|resync|study me|re-?read me)[.!]*$/i.test(t)) return { op: 'resync' };
+  if (/^(?:check (?:my )?email|email digest|check (?:my )?inbox|check gmail)[?.!]*$/i.test(t)) return { op: 'gmaildigest' };
   if (/^(?:persona\s+off|be\s+yourself|reset\s+persona)[.!]*$/i.test(t)) return { op: 'personaclear' };
   if ((m = /^persona[:\s]\s*(.+)$/i.exec(text))) return { op: 'persona', directive: (m[1] ?? '').trim() };
   // "be a hardass with me" / "be my drill sergeant" — store the owner's whole

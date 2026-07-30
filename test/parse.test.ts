@@ -56,6 +56,10 @@ describe('deterministic grammar', () => {
   it('nag relentless', () => expect(parseDeterministic('nag relentless')).toEqual({ op: 'naglevel', level: 'relentless' }));
   it('learn now', () => expect(parseDeterministic('learn now')).toEqual({ op: 'resync' }));
   it('study me', () => expect(parseDeterministic('study me')).toEqual({ op: 'resync' }));
+  it('check email', () => expect(parseDeterministic('check email')).toEqual({ op: 'gmaildigest' }));
+  it('check my email', () => expect(parseDeterministic('check my email')).toEqual({ op: 'gmaildigest' }));
+  it('email digest', () => expect(parseDeterministic('email digest')).toEqual({ op: 'gmaildigest' }));
+  it('check inbox', () => expect(parseDeterministic('check inbox')).toEqual({ op: 'gmaildigest' }));
 
   it('be a <vibe> locks persona verbatim', () =>
     expect(parseDeterministic('be a hardass with me dont go soft')).toEqual({

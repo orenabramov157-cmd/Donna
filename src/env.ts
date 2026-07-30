@@ -16,6 +16,9 @@ export interface Secrets {
   TWILIO_ACCOUNT_SID?: string;
   TWILIO_AUTH_TOKEN?: string;
   TWILIO_FROM?: string;
+  GMAIL_CLIENT_ID?: string;
+  GMAIL_CLIENT_SECRET?: string;
+  GMAIL_REFRESH_TOKEN?: string;
 }
 
 // `wrangler types` narrows vars to the literal values in wrangler.jsonc, but
