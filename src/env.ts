@@ -19,6 +19,7 @@ export interface Secrets {
   GMAIL_CLIENT_ID?: string;
   GMAIL_CLIENT_SECRET?: string;
   GMAIL_REFRESH_TOKEN?: string;
+  TAVILY_API_KEY?: string;
 }
 
 // `wrangler types` narrows vars to the literal values in wrangler.jsonc, but

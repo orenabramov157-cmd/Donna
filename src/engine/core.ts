@@ -58,7 +58,7 @@ import {
   type LocalParts,
 } from '../time';
 import { aiBudgetOk, parseDeterministic, type Command, type NagLevel } from '../parse';
-import { extractModelText, interpret, reflect, type BrainAction } from './brain';
+import { answerFromSearch, extractModelText, interpret, reflect, type BrainAction } from './brain';
 import { ladderStage } from './ladder';
 import { inQuietHours, nagPolicy, nagsSentToday, shouldPulse, shouldRenag } from './nag';
 import * as copy from './copy';
@@ -75,6 +75,7 @@ import {
 } from '../trello';
 import { encodeDeliveryAttemptMetadata, getChannel, type Inbound, type SendOpts } from '../channel';
 import { gmailConfigured, listRecentMessages } from '../gmail';
+import { searchConfigured, webSearch } from '../search';
 
 const OUTBOUND_KINDS = ['nag', 'checkin', 'pulse', 'plan', 'recap', 'receipt', 'chat', 'misc'];
 const PLAN_SLOTS = ['10:00', '14:00', '16:30'];
@@ -771,6 +772,7 @@ async function brainRoute(c: Ctx, session: SessionRow, text: string): Promise<vo
     schedInsights: schedInsights || null,
     todayLocal: c.today,
     tz: c.tz,
+    searchAvailable: searchConfigured(c.env),
   });
   if (!result) {
     // Rare now (parsing is retried + shape-tolerant). Never interrogate —
@@ -778,17 +780,56 @@ async function brainRoute(c: Ctx, session: SessionRow, text: string): Promise<vo
     await sendOwner(c, 'chat', copy.SOFT_ACK);
     return;
   }
-  if (result.actions.length === 0) {
+  const searchAction = result.actions.find(
+    (a): a is Extract<BrainAction, { type: 'search' }> => a.type === 'search',
+  );
+  const otherActions = result.actions.filter((a) => a.type !== 'search');
+  if (searchAction) {
+    await handleSearchAction(c, text, transcript, searchAction.query, styleCard, persona);
+  } else if (otherActions.length === 0) {
     // Pure conversation. Reply in her learned voice; never ask a question.
     await sendOwner(c, 'chat', result.reply ?? copy.SOFT_ACK);
     return;
   }
   const adds: AddSpec[] = [];
-  for (const action of result.actions) {
+  for (const action of otherActions) {
     if (action.type === 'add_task') adds.push(action);
     else await runBrainAction(c, session, action, open);
   }
   if (adds.length > 0) await addTasksBatch(c, adds);
+}
+
+// Grounds a "search" action into a real, texted answer. searchConfigured()
+// gates this off entirely when TAVILY_API_KEY is absent — the brain itself
+// never emits a search action in that case (see interpret()'s conditional
+// prompt), so this branch mainly guards against a stale/racing config.
+async function handleSearchAction(
+  c: Ctx,
+  originalText: string,
+  transcript: string,
+  query: string,
+  styleCard: string | null,
+  persona: string | null,
+): Promise<void> {
+  if (!searchConfigured(c.env)) {
+    await sendOwner(c, 'chat', `I'd actually look that up, but web search isn't wired in yet — ask whoever set up this Donna to add it.`);
+    return;
+  }
+  const found = await webSearch(c.env, query);
+  if (!found) {
+    await sendOwner(c, 'chat', `Tried to look that up and the search failed — try asking again in a sec.`);
+    return;
+  }
+  const answer = await answerFromSearch(c.env, c.today, {
+    originalText,
+    transcript,
+    query,
+    engineAnswer: found.answer,
+    results: found.results,
+    styleCard,
+    persona,
+  });
+  await sendOwner(c, 'chat', answer ?? `Found results but couldn't put together an answer — try again?`);
 }
 
 // -- nightly reflection (v1.2) ----------------------------------------------
@@ -1762,6 +1803,17 @@ export async function runSetup(env: AppEnv, requestUrl: URL): Promise<string> {
     });
   } else {
     steps.push({ name: 'Gmail digest (optional)', ok: true, note: 'not configured — bot runs standalone' });
+  }
+
+  if (searchConfigured(env)) {
+    const test = await webSearch(env, 'test', 1);
+    steps.push({
+      name: 'Web search',
+      ok: test !== null,
+      note: test !== null ? 'connected — she can research real-world questions' : 'credentials present but the search call failed — check TAVILY_API_KEY',
+    });
+  } else {
+    steps.push({ name: 'Web search (optional)', ok: true, note: 'not configured — she\'ll say so honestly instead of guessing' });
   }
 
   const coreReady = Boolean(profileReady && env.LOOP_AUTH_KEY && env.LOOP_WEBHOOK_AUTH && env.WEBHOOK_TOKEN);

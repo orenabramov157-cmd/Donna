@@ -40,7 +40,8 @@ export type BrainAction =
   | { type: 'undo' }
   | { type: 'help' }
   | { type: 'set_nag'; level: 'gentle' | 'standard' | 'relentless' }
-  | { type: 'set_persona'; directive: string };
+  | { type: 'set_persona'; directive: string }
+  | { type: 'search'; query: string };
 
 export interface Interpretation {
   actions: BrainAction[];
@@ -175,6 +176,11 @@ export function validateInterpretation(rawText: string, taskCount: number, today
         if (directive) actions.push({ type: 'set_persona', directive: directive.slice(0, 240) });
         break;
       }
+      case 'search': {
+        const query = str(a.query);
+        if (query) actions.push({ type: 'search', query: query.slice(0, 300) });
+        break;
+      }
       default:
         break;
     }
@@ -231,6 +237,7 @@ export interface BrainInput {
   schedInsights: string | null;
   todayLocal: string;
   tz: string;
+  searchAvailable: boolean;
 }
 
 function taskListForPrompt(tasks: TaskRow[], tz: string): string {
@@ -277,6 +284,9 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     `{"type":"complete","task":n} {"type":"start","task":n} {"type":"notdone","task":n} {"type":"snooze","task":n,"minutes":m} {"type":"defer","task":n} {"type":"drop","task":n,"reason":str|null} {"type":"blocked","task":n,"reason":str} {"type":"set_time","task":n,"time":"HH:MM","date":"YYYY-MM-DD"|null}`,
     `{"type":"status"} {"type":"plan"} {"type":"no_plan"} {"type":"confirm_plan"} {"type":"undo"} {"type":"help"} {"type":"set_nag","level":"gentle|standard|relentless"}`,
     `{"type":"set_persona","directive":str} — when the owner tells you HOW to behave or talk to them (not a task): "be tougher on me", "stop being soft", "talk to me like a coach", "push me harder", "chill out with the nagging tone". Capture their intent as a concise standing instruction to yourself (e.g. "Be a blunt drill sergeant — push hard, no coddling."). Also obey it immediately in this very "reply".`,
+    input.searchAvailable
+      ? `{"type":"search","query":str} — you have live web search. Use it whenever the owner needs real-world, current, or location-specific facts you can't reliably know yourself: restaurant/business/place recommendations, "near me" or "in <city>" requests, current events, prices, hours, addresses, anything time-sensitive. Write a good, specific search query (include their location/constraints if given). When you emit search, leave "reply" null — the search result becomes the reply.`
+      : '',
     `TIME RULES (critical — get these exactly right):`,
     `- "remind me in X" / "in X minutes|hours|days" → use remind_in_minutes ONLY (minutes=5, hours×60, days×1440). Example: "in 24 hours"→remind_in_minutes:1440. "in 3 days"→4320. NEVER convert a relative offset into a clock time.`,
     `- A clock time to be nagged ("nag me at 3pm", "remind me at 10am tomorrow") → remind_time (+remind_date if a day is named). "tomorrow 10am"→remind_date=tomorrow's date, remind_time:"10:00".`,
@@ -289,7 +299,7 @@ export async function interpret(env: AppEnv, input: BrainInput): Promise<Interpr
     `- Pure conversation with no task operation → actions=[] and a short "reply" in their style.`,
     `- "question" must always be null. Use "reply" instead.`,
     `- confidence <0.5 only if you truly cannot act at all.`,
-    `- Never silently pretend to have a capability you don't. You have no Google Calendar, no email-sending, no phone calls, no live internet/web search — if a request references one of these, still capture what you CAN (e.g. add it as a task/reminder here) but say so plainly in "reply" (e.g. "Added it here — heads up, I can't touch your actual Google Calendar yet."). Never reply "✅ Got it" as if the unavailable part happened.`,
+    `- Never silently pretend to have a capability you don't. You have no Google Calendar, no email-sending, no phone calls${input.searchAvailable ? '' : ', no live internet/web search'} — if a request references one of these, still capture what you CAN (e.g. add it as a task/reminder here) but say so plainly in "reply" (e.g. "Added it here — heads up, I can't touch your actual Google Calendar yet."). Never reply "✅ Got it" as if the unavailable part happened.`,
     `- If the owner asks you to get to know them / understand them better / asks for questions to answer, don't just acknowledge it — actually ask 2-3 real, specific questions right there in "reply".`,
   ]
     .filter(Boolean)
@@ -381,6 +391,56 @@ export async function reflect(
     return { style: (style ?? '').slice(0, 400), insights: (insights ?? '').slice(0, 400) };
   } catch (err) {
     console.error(JSON.stringify({ evt: 'reflect_failed', err: err instanceof Error ? err.message : String(err) }));
+    return null;
+  }
+}
+
+// -- search answer (grounds a "search" action's results into a texted reply)
+
+export interface SearchAnswerInput {
+  originalText: string;
+  transcript: string;
+  query: string;
+  engineAnswer: string | null;
+  results: Array<{ title: string; url: string; content: string }>;
+  styleCard: string | null;
+  persona: string | null;
+}
+
+export async function answerFromSearch(env: AppEnv, todayLocal: string, input: SearchAnswerInput): Promise<string | null> {
+  const resultLines = input.results
+    .map((r, i) => `${i + 1}. ${r.title} — ${r.content} (${r.url})`)
+    .join('\n');
+  if (!(await aiBudgetOk(env, todayLocal))) {
+    // No AI budget left — a bare list still beats silence.
+    if (input.results.length === 0) return null;
+    return input.results
+      .slice(0, 3)
+      .map((r) => `${r.title} — ${r.url}`)
+      .join('\n');
+  }
+  const system = [
+    `You are Donna, texting the owner a real answer to their question using live web search results below. Voice: brief, direct, texting register — this is a text message, not a report. Give actual specific names/places/facts when the results have them, not vague categories. If the results are genuinely empty or don't answer the question, say so honestly rather than inventing something.`,
+    input.styleCard ? `Mirror how they talk: ${input.styleCard}` : '',
+    input.persona ? `Standing order: ${input.persona}` : '',
+    `Their question: "${input.originalText}"`,
+    `Recent conversation:\n${input.transcript || '(none)'}`,
+    `Search query used: "${input.query}"`,
+    input.engineAnswer ? `Search engine's own summary: ${input.engineAnswer}` : '',
+    `Raw results:\n${resultLines || '(no results found)'}`,
+    `Reply with the actual answer, under 700 characters. No preamble.`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+  try {
+    const out: unknown = await env.AI.run(
+      (env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast') as Parameters<Ai['run']>[0],
+      { messages: [{ role: 'system', content: system }, { role: 'user', content: 'Answer using the search results.' }], max_tokens: 450 },
+    );
+    const text = extractModelText(out);
+    return text ? text.trim().slice(0, 900) : null;
+  } catch (err) {
+    console.error(JSON.stringify({ evt: 'search_answer_failed', err: err instanceof Error ? err.message : String(err) }));
     return null;
   }
 }

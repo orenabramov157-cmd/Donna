@@ -170,6 +170,29 @@ describe('validateInterpretation', () => {
     expect((r!.actions[0] as { directive: string }).directive.length).toBeLessThanOrEqual(240);
   });
 
+  it('accepts a search action and caps the query length', () => {
+    const raw = JSON.stringify({
+      actions: [{ type: 'search', query: 'hole in the wall restaurants near picfair village los angeles ' + 'x'.repeat(300) }],
+      reply: null,
+      question: null,
+      confidence: 0.8,
+    });
+    const r = validateInterpretation(raw, 0, TODAY);
+    expect(r!.actions[0]).toMatchObject({ type: 'search' });
+    expect((r!.actions[0] as { query: string }).query.length).toBeLessThanOrEqual(300);
+  });
+
+  it('drops a search action with an empty query', () => {
+    const raw = JSON.stringify({
+      actions: [{ type: 'search', query: '   ' }],
+      reply: 'lol what',
+      question: null,
+      confidence: 0.6,
+    });
+    const r = validateInterpretation(raw, 0, TODAY);
+    expect(r!.actions).toHaveLength(0);
+  });
+
   it('validates snooze minutes with sane clamping', () => {
     const raw = JSON.stringify({
       actions: [{ type: 'snooze', task: 1, minutes: 9999 }],

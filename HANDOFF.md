@@ -34,7 +34,7 @@ free tier. Your computer is only needed for this setup; afterwards it can sleep 
 1. Sign up free at [loopmessage.com](https://loopmessage.com) and open their dashboard, then click **View** on your Default organization.
 2. In the left sidebar, open **Sandbox** and register **your own phone number** (or Apple ID email) as a sandbox contact. ⚠️ It must match whatever your iPhone uses in **Settings → Messages → Send & Receive → "Start new conversations from"** (usually your phone number).
 3. In the left sidebar under **API → Settings**, find your **Organization API Key**. Keep that tab open — you'll paste the key in Step 5.
-4. Know this rule now, it explains a later step: **the sandbox can never text you first.** You must send the first message (Step 9 handles it — the bot's first send error even gives you a personal opt-in link if needed).
+4. Know this rule now, it explains a later step: **the sandbox can never text you first.** You must send the first message (Step 10 handles it — the bot's first send error even gives you a personal opt-in link if needed).
 
 ✅ **Check:** your number is listed as a sandbox contact and you can see the API key.
 
@@ -96,7 +96,17 @@ Skip this if you don't want it — the bot works fine without it. Read-only: not
 
 ✅ **Check:** re-run `/setup` — a **Gmail digest** row appears and shows ✅ connected.
 
-## Step 8 — Your timezone and schedule
+## Step 8 — Web search (optional, real-world lookups)
+
+Skip this if you don't want it. Without it, Donna will say plainly when she can't look something up rather than guessing. With it, she can answer real questions — "find me X near me," current info, recommendations — using live web results, not just what the model already knows.
+
+1. Go to [tavily.com](https://tavily.com) → sign up free (no credit card — 1,000 searches/month free).
+2. Copy your **API key** from the dashboard (starts with `tvly-`).
+3. In Cloudflare **Variables and Secrets**, add one Secret: `TAVILY_API_KEY`.
+
+✅ **Check:** re-run `/setup` — a **Web search** row appears and shows ✅ connected. That's it — no OAuth, no consent screen, this one's simple.
+
+## Step 9 — Your timezone and schedule
 
 Still in **Settings → Variables and Secrets**, the plain-text **variables** control the schedule. Edit if needed (then Deploy):
 
@@ -109,7 +119,7 @@ Still in **Settings → Variables and Secrets**, the plain-text **variables** co
 
 `/setup` validates the entire profile before saving any of it. If one value is invalid, the page names the bad variable and leaves the previous profile unchanged.
 
-## Step 9 — Run setup
+## Step 10 — Run setup
 
 Open in your browser (swap in your Worker URL and your `SETUP_KEY`):
 
@@ -127,7 +137,7 @@ Then follow the **"Wire up LoopMessage"** box on that page — and here is the #
 
 ✅ **Check:** every row on the setup page is ✅.
 
-## Step 10 — Test it
+## Step 11 — Test it
 
 Click **"Send a test iMessage"** on the setup page. Your phone should buzz within seconds.
 
@@ -144,12 +154,14 @@ Reply **`help`** to see the commands. Reply **`plan`** to plan your first day.
 - Morning: bot proposes the day from Trello + carryovers → reply `ok` (or `2 at 3pm` to adjust)
 - When nagged: `done` · `start` · `snooze 30` · `tomorrow` · `blocked <why>` — or just react 👍 to complete
 - Anytime: `status` · `add: call vendor 10am` · `undo` · `nag relentless` · `check email` · `help`
+- Just ask her real questions too — "find me a hole-in-the-wall near Picfair Village" — if web search is wired up (Step 8) she'll actually look it up.
 - Deferring has consequences (by design): the bot will demand a next action, then a smaller task, then a 10-minute start — and parks anything deferred 5 days running.
 
 ## Troubleshooting
 
 - **No texts?** `/health` should show a recent `last_cron_at`. Check LoopMessage's webhook history in their dashboard, and Cloudflare → your Worker → **Logs** (live tail).
-- **Bot doesn't answer replies?** Check LoopMessage's **API → Webhooks history** page. "No data" = the *Sandbox* webhook fields were never filled (Step 9 — they're on the Sandbox page, not API Settings). Rows showing **failed 401** = the header value doesn't exactly match your `LOOP_WEBHOOK_AUTH` secret — re-paste it cleanly, Save sandbox, then press **Retry** on the failed rows.
+- **Bot doesn't answer replies?** Check LoopMessage's **API → Webhooks history** page. "No data" = the *Sandbox* webhook fields were never filled (Step 10 — they're on the Sandbox page, not API Settings). Rows showing **failed 401** = the header value doesn't exactly match your `LOOP_WEBHOOK_AUTH` secret — re-paste it cleanly, Save sandbox, then press **Retry** on the failed rows.
+- **Web search not working / she says she can't look things up?** Re-run `/setup` — a red Web search row means `TAVILY_API_KEY` is missing or wrong. Without it, she's supposed to say so honestly rather than guess — that's not a bug.
 - **"Text the sandbox first" but you don't know the number?** Trigger a test send from `/setup` anyway — the failure detail (Cloudflare → Worker → Logs) includes the exact sandbox number to text, e.g. "Need to init conversation from X to sandbox: Y".
 - **Trello not syncing?** Re-run `/setup` — it checks `TRELLO_APP_SECRET`, re-registers the signed board webhook, and re-resolves the Today/Done lists. If the lists row is red, it now lists your board's actual list names so you can match `TRELLO_TODAY_LIST`/`TRELLO_DONE_LIST` to them exactly.
 - **Gmail digest not working?** Re-run `/setup` — a red Gmail row with "token exchange failed" means `GMAIL_REFRESH_TOKEN` is stale or wrong; regenerate it via the OAuth Playground (Step 7) and update the secret.
