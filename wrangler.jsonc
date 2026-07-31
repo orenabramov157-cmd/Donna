@@ -39,6 +39,10 @@
 		"PULSE_EVERY_MIN": "150",
 		"CHANNEL": "loopmessage",
 		"AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+		// Used only for pure summarization (Gmail digest, search-result answers)
+		// where reasoning depth matters less than speed — not for task
+		// interpretation, which stays on the larger AI_MODEL above.
+		"AI_MODEL_FAST": "@cf/meta/llama-3.1-8b-instruct-fast",
 		"AI_DAILY_CAP": "40",
 		"TRELLO_TODAY_LIST": "Today",
 		"TRELLO_DONE_LIST": "Done",

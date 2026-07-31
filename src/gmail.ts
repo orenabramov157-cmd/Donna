@@ -7,16 +7,41 @@ import type { AppEnv } from './env';
 
 const TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const API_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me';
+const FETCH_TIMEOUT_MS = 8_000;
 
 export function gmailConfigured(env: AppEnv): boolean {
   return Boolean(env.GMAIL_CLIENT_ID && env.GMAIL_CLIENT_SECRET && env.GMAIL_REFRESH_TOKEN);
+}
+
+// Every Gmail/Google call goes through this — without a timeout, one slow
+// upstream response hangs the whole inbound message indefinitely (this bit
+// us live: a "check email" reply took 5m07s because a hung fetch only
+// resolved once the cron sweep's retry happened to land after it cleared).
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    console.error(
+      JSON.stringify({
+        evt: 'gmail_fetch_error',
+        url,
+        aborted: err instanceof Error && err.name === 'AbortError',
+        err: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // Access tokens are short-lived (~1h); refreshed on every digest rather than
 // cached, since digests run at most a handful of times a day.
 async function getAccessToken(env: AppEnv): Promise<string | null> {
   if (!env.GMAIL_CLIENT_ID || !env.GMAIL_CLIENT_SECRET || !env.GMAIL_REFRESH_TOKEN) return null;
-  const res = await fetch(TOKEN_URL, {
+  const res = await fetchWithTimeout(TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
@@ -26,6 +51,7 @@ async function getAccessToken(env: AppEnv): Promise<string | null> {
       grant_type: 'refresh_token',
     }),
   });
+  if (!res) return null;
   if (!res.ok) {
     const detail = (await res.text()).slice(0, 300);
     console.error(JSON.stringify({ evt: 'gmail_token_refresh_failed', status: res.status, detail }));
@@ -47,13 +73,16 @@ function headerValue(headers: Array<{ name?: string; value?: string }>, name: st
 
 // Messages received in the last `sinceHours`, newest first, capped at
 // `limit`. Metadata only (From/Subject/snippet) — bodies are never fetched,
-// keeping this strictly read-summary, not full mail access.
-export async function listRecentMessages(env: AppEnv, sinceHours: number, limit = 15): Promise<GmailMessage[] | null> {
+// keeping this strictly read-summary, not full mail access. Default limit
+// kept small (not Gmail's max) so a "check email" reply stays fast: fewer
+// parallel API round trips and a shorter summarization prompt.
+export async function listRecentMessages(env: AppEnv, sinceHours: number, limit = 8): Promise<GmailMessage[] | null> {
   const token = await getAccessToken(env);
   if (!token) return null;
   const auth = { Authorization: `Bearer ${token}` };
   const q = encodeURIComponent(`newer_than:${Math.max(1, Math.round(sinceHours))}h`);
-  const listRes = await fetch(`${API_BASE}/messages?q=${q}&maxResults=${limit}`, { headers: auth });
+  const listRes = await fetchWithTimeout(`${API_BASE}/messages?q=${q}&maxResults=${limit}`, { headers: auth });
+  if (!listRes) return null;
   if (!listRes.ok) {
     console.error(JSON.stringify({ evt: 'gmail_list_failed', status: listRes.status }));
     return null;
@@ -64,11 +93,11 @@ export async function listRecentMessages(env: AppEnv, sinceHours: number, limit 
 
   const messages = await Promise.all(
     ids.map(async (id) => {
-      const res = await fetch(
+      const res = await fetchWithTimeout(
         `${API_BASE}/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
         { headers: auth },
       );
-      if (!res.ok) return null;
+      if (!res || !res.ok) return null;
       const data = (await res.json()) as { snippet?: string; payload?: { headers?: Array<{ name?: string; value?: string }> } };
       const headers = data.payload?.headers ?? [];
       return {

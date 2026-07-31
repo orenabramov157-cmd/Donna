@@ -434,7 +434,10 @@ export async function answerFromSearch(env: AppEnv, todayLocal: string, input: S
     .join('\n');
   try {
     const out: unknown = await env.AI.run(
-      (env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast') as Parameters<Ai['run']>[0],
+      // Grounding search results into prose is summarization, not the multi-
+      // step task reasoning interpret() needs — the fast model is plenty
+      // and answers land noticeably quicker.
+      (env.AI_MODEL_FAST || '@cf/meta/llama-3.1-8b-instruct-fast') as Parameters<Ai['run']>[0],
       { messages: [{ role: 'system', content: system }, { role: 'user', content: 'Answer using the search results.' }], max_tokens: 450 },
     );
     const text = extractModelText(out);

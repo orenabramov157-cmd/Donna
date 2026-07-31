@@ -922,7 +922,10 @@ async function buildGmailDigest(c: Ctx, sinceHours: number): Promise<string | nu
   ].join('\n');
   try {
     const out: unknown = await c.env.AI.run(
-      (c.env.AI_MODEL || '@cf/meta/llama-3.3-70b-instruct-fp8-fast') as Parameters<Ai['run']>[0],
+      // Pure summarization, not task reasoning — the small fast model is
+      // plenty and cuts real latency (a "check email" reply was measured
+      // taking 5m07s once, partly this call).
+      (c.env.AI_MODEL_FAST || '@cf/meta/llama-3.1-8b-instruct-fast') as Parameters<Ai['run']>[0],
       { messages: [{ role: 'system', content: system }, { role: 'user', content: 'Summarize.' }], max_tokens: 400 },
     );
     const text = extractModelText(out);
